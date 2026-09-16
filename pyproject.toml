@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "runner*"]
+
+[project]
+name = "eval-platform"
+version = "1.0.0"
+description = "Database-first agent evaluation platform (FastAPI + PostgreSQL + psycopg 3)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "psycopg[binary]>=3.2.0",
+    "psycopg-pool>=3.2.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "httpx>=0.28.0",
+    "python-multipart>=0.0.17",
+    "structlog>=24.4.0",
+    "prometheus-client>=0.21.0",
+    "slowapi>=0.1.9",
+    "tenacity>=9.0.0",
+    "rapidfuzz>=3.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+eval-platform-migrate = "app.db.migration_runner:main"
+eval-platform-runner = "runner.main:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

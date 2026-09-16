@@ -1,0 +1,100 @@
+{
+  "name": "support-triage-quality",
+  "description": "Deterministic workflow checks plus an LLM judge for summary quality.",
+  "config": {
+    "evaluation_type": "agent_workflow",
+    "evaluation_version": "1",
+    "target_agents": ["classifier", "validator", "summarizer"],
+    "workflow_order": ["classifier", "validator", "summarizer"],
+    "on_missing_context": "not_applicable",
+    "model": { "provider": "openai", "model": "gpt-4o-mini", "temperature": 0 },
+    "defaults": { "max_attempts": 3, "priority": 0 },
+    "checks": [
+      {
+        "check_id": "all_agents_ran",
+        "evaluator": "span_exists",
+        "input_mapping": { "spans": "spans" },
+        "params": { "required_spans": ["classifier", "validator", "summarizer"] },
+        "priority": 10
+      },
+      {
+        "check_id": "workflow_sequence",
+        "evaluator": "workflow_order",
+        "input_mapping": { "spans": "spans" },
+        "params": {
+          "expected_order": ["classifier", "validator", "summarizer"],
+          "mode": "subsequence"
+        }
+      },
+      {
+        "check_id": "classifier_output_structure",
+        "evaluator": "json_schema",
+        "input_mapping": { "output": "classifier.output" },
+        "params": {
+          "target": "output",
+          "schema": {
+            "type": "object",
+            "required": ["category", "confidence"],
+            "properties": {
+              "category": { "type": "string", "enum": ["billing", "technical", "account"] },
+              "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+            }
+          }
+        }
+      },
+      {
+        "check_id": "summary_present",
+        "evaluator": "required_fields",
+        "input_mapping": { "summary": "summarizer.output.summary" },
+        "params": { "fields": ["summary"] }
+      },
+      {
+        "check_id": "policy_tool_called_with_response",
+        "evaluator": "tool_calls",
+        "input_mapping": { "tool_calls": "validator.tool_calls" },
+        "params": { "expected_tools": ["policy_lookup"], "require_response": true }
+      },
+      {
+        "check_id": "category_agreement",
+        "evaluator": "cross_span_consistency",
+        "input_mapping": {
+          "classified": "classifier.output.category",
+          "summarized": "summarizer.output.category"
+        },
+        "params": {
+          "comparisons": [
+            {
+              "left": "classified",
+              "right": "summarized",
+              "method": "exact",
+              "label": "classifier vs summarizer category"
+            }
+          ]
+        }
+      },
+      {
+        "check_id": "response_mentions_resolution",
+        "evaluator": "field_comparison",
+        "input_mapping": { "actual": "session_context.final_response" },
+        "params": {
+          "actual": "actual",
+          "verifier": { "type": "contains_all", "contains": ["refund"] }
+        }
+      },
+      {
+        "check_id": "summary_faithfulness",
+        "check_type": "LLM_JUDGE",
+        "input_mapping": {
+          "summary": "summarizer.output.summary",
+          "conversation": "session_context.conversation_history"
+        },
+        "params": {
+          "criteria": "Does the summary faithfully and completely reflect the conversation, without inventing facts?",
+          "pass_threshold": 0.7,
+          "max_tokens": 300
+        },
+        "max_attempts": 3
+      }
+    ]
+  }
+}

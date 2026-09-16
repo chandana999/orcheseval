@@ -1,0 +1,93 @@
+"""Recovery of abandoned work.
+
+A runner that crashes leaves tickets RUNNING with an expired lease. PostgreSQL is
+the source of truth, so recovery is a query: reclaim expired leases, settle
+tickets belonging to cancelled jobs, and recompute the affected jobs.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+
+from psycopg import Connection
+
+from app.core.logging import get_logger
+from app.core.metrics import TICKET_TRANSITIONS, TICKETS_RECOVERED
+from app.models.enums import TicketStatus
+from app.repositories.job_repository import JobRepository
+from app.repositories.ticket_repository import TicketRepository
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class RecoveryReport:
+    recovered_to_retry: int = 0
+    recovered_to_failed: int = 0
+    cancelled_running: int = 0
+    jobs_updated: list[str] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return self.recovered_to_retry + self.recovered_to_failed + self.cancelled_running
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "recovered_to_retry": self.recovered_to_retry,
+            "recovered_to_failed": self.recovered_to_failed,
+            "cancelled_running": self.cancelled_running,
+            "jobs_updated": self.jobs_updated,
+            "total": self.total,
+        }
+
+
+def recover_abandoned_tickets(conn: Connection, *, limit: int = 100) -> RecoveryReport:
+    """Reclaim expired leases and settle running tickets on cancelled jobs."""
+    report = RecoveryReport()
+    tickets = TicketRepository(conn)
+    affected: set[uuid.UUID] = set()
+
+    for ticket in tickets.recover_expired_leases(limit=limit):
+        affected.add(ticket.job_id)
+        if ticket.status is TicketStatus.CANCELLED:
+            report.cancelled_running += 1
+            TICKETS_RECOVERED.labels(outcome="cancelled").inc()
+            TICKET_TRANSITIONS.labels(from_status="RUNNING", to_status="CANCELLED").inc()
+        elif ticket.status is TicketStatus.FAILED:
+            report.recovered_to_failed += 1
+            TICKETS_RECOVERED.labels(outcome="failed").inc()
+            TICKET_TRANSITIONS.labels(from_status="RUNNING", to_status="FAILED").inc()
+        else:
+            report.recovered_to_retry += 1
+            TICKETS_RECOVERED.labels(outcome="retry").inc()
+            TICKET_TRANSITIONS.labels(from_status="RUNNING", to_status="RETRY").inc()
+
+    for ticket in tickets.cancel_running_for_cancelled_jobs(limit=limit):
+        affected.add(ticket.job_id)
+        report.cancelled_running += 1
+        TICKETS_RECOVERED.labels(outcome="cancelled").inc()
+        TICKET_TRANSITIONS.labels(from_status="RUNNING", to_status="CANCELLED").inc()
+
+    jobs = JobRepository(conn)
+    for job_id in affected:
+        jobs.recompute_progress(job_id)
+        report.jobs_updated.append(str(job_id))
+
+    if report.total:
+        logger.info("tickets_recovered", **report.as_dict())
+    return report
+
+
+def reconcile_job(conn: Connection, job_id: uuid.UUID) -> None:
+    """Force a job's counters and status to match its ticket rows."""
+    JobRepository(conn).recompute_progress(job_id)
+
+
+def reconcile_active_jobs(conn: Connection) -> int:
+    """Recompute every job that still has non-terminal tickets (startup sweep)."""
+    jobs = JobRepository(conn)
+    job_ids = TicketRepository(conn).jobs_with_active_tickets()
+    for job_id in job_ids:
+        jobs.recompute_progress(job_id)
+    return len(job_ids)
