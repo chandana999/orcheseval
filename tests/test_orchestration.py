@@ -49,9 +49,7 @@ def test_skip_locked_prevents_two_runners_taking_the_same_ticket(seeded_job):
     second = _raw_connection()
     try:
         with first.transaction():
-            batch_one = TicketRepository(first).claim(
-                limit=3, worker_id="w-1", lease_seconds=60
-            )
+            batch_one = TicketRepository(first).claim(limit=3, worker_id="w-1", lease_seconds=60)
             assert len(batch_one) == 3
             # While the first transaction is still open, the second runner must
             # skip those rows rather than block on them.
@@ -70,7 +68,7 @@ def test_skip_locked_prevents_two_runners_taking_the_same_ticket(seeded_job):
 
 def test_tickets_of_cancelled_jobs_are_not_claimable(seeded_job, client):
     job_id = seeded_job["job"]["id"]
-    client.post(f"/api/v1/evaluation-jobs/{job_id}/cancel")
+    client.post(f"/v1/evaluation-jobs/{job_id}/cancel")
     with transaction() as conn:
         assert claim_tickets(conn, worker_id="w-1", limit=10) == []
 
@@ -160,7 +158,7 @@ def test_running_tickets_on_cancelled_jobs_are_swept(seeded_job, client):
     job_id = seeded_job["job"]["id"]
     with transaction() as conn:
         ticket = claim_tickets(conn, worker_id="w-1", limit=1, lease_seconds=60)[0]
-    client.post(f"/api/v1/evaluation-jobs/{job_id}/cancel")
+    client.post(f"/v1/evaluation-jobs/{job_id}/cancel")
     with transaction() as conn:
         conn.execute(
             "UPDATE evaluation_tickets SET lease_expires_at = now() - interval '1 second' "
@@ -222,7 +220,7 @@ def test_failed_ticket_can_be_reset_to_ready(seeded_job, client):
     with transaction() as conn:
         assert JobRepository(conn).get(uuid.UUID(job_id)).status is JobStatus.FAILED
 
-    response = client.post(f"/api/v1/evaluation-jobs/{job_id}/retry-failed")
+    response = client.post(f"/v1/evaluation-jobs/{job_id}/retry-failed")
     assert response.status_code == 200
     assert response.json()["reset_count"] == 6
 

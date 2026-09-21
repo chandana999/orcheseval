@@ -14,7 +14,6 @@ class JobRepository(BaseRepository):
             id=row["id"],
             name=row["name"],
             dataset_id=row["dataset_id"],
-            evaluation_config_id=row["evaluation_config_id"],
             config_snapshot_json=row["config_snapshot_json"],
             status=self._enum(JobStatus, row["status"]),
             payload_count=row["payload_count"],
@@ -35,17 +34,16 @@ class JobRepository(BaseRepository):
         row = self.conn.execute(
             """
             INSERT INTO evaluation_jobs (
-                id, name, dataset_id, evaluation_config_id, config_snapshot_json,
+                id, name, dataset_id, config_snapshot_json,
                 status, payload_count, total_tickets
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
                 job.id,
                 job.name,
                 job.dataset_id,
-                job.evaluation_config_id,
                 self._json(job.config_snapshot_json),
                 job.status.value,
                 job.payload_count,
@@ -55,9 +53,7 @@ class JobRepository(BaseRepository):
         return self._to_entity(row)
 
     def get(self, job_id: uuid.UUID) -> EvaluationJob | None:
-        row = self.conn.execute(
-            "SELECT * FROM evaluation_jobs WHERE id = %s", (job_id,)
-        ).fetchone()
+        row = self.conn.execute("SELECT * FROM evaluation_jobs WHERE id = %s", (job_id,)).fetchone()
         return self._to_entity(row) if row else None
 
     def get_for_update(self, job_id: uuid.UUID) -> EvaluationJob | None:
@@ -84,7 +80,7 @@ class JobRepository(BaseRepository):
         self,
         *,
         status: JobStatus | None = None,
-        dataset_id: uuid.UUID | None = None,
+        dataset_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[EvaluationJob]]:

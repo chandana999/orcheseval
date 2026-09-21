@@ -38,10 +38,8 @@ class Settings(BaseSettings):
     db_pool_max_size: int = 20
     db_connect_timeout: int = 10
 
-    # Optional local file ingestion / export -------------------------------
-    local_storage_root: str = "./data/storage"
-    max_upload_bytes: int = 50 * 1024 * 1024
-    max_payloads_per_dataset: int = 100_000
+    # Temporary dataset input (folder-per-dataset_id). Not a durable store.
+    evaluation_temp_root: str = "./temp"
 
     # Runner ---------------------------------------------------------------
     runner_poll_interval_seconds: float = 2.0
@@ -128,7 +126,9 @@ class Settings(BaseSettings):
         try:
             return [float(p) for p in parts]
         except ValueError as exc:  # pragma: no cover - configuration error path
-            raise ValueError("RUNNER_RETRY_BACKOFF_SECONDS must be a comma separated number list") from exc
+            raise ValueError(
+                "RUNNER_RETRY_BACKOFF_SECONDS must be a comma separated number list"
+            ) from exc
 
     def backoff_for_attempt(self, attempt_count: int) -> float:
         """Backoff for the attempt that just failed (1-based)."""

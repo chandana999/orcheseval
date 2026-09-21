@@ -106,6 +106,11 @@ class EvaluationRunner:
                 error=str(exc),
                 exc_info=True,
             )
+        finally:
+            # Counted here rather than in a done callback: waiters are notified
+            # before callbacks run, so the shutdown log could undercount.
+            with self._lock:
+                self.processed += 1
 
     def _submit(self, executor: ThreadPoolExecutor, tickets: list[EvaluationTicket]) -> None:
         for ticket in tickets:
@@ -116,7 +121,6 @@ class EvaluationRunner:
             def done(fut: Future, _self=self) -> None:
                 with _self._lock:
                     _self._inflight.discard(fut)
-                    _self.processed += 1
 
             future.add_done_callback(done)
 
@@ -142,20 +146,23 @@ class EvaluationRunner:
             )
 
     def run_once(self, executor: ThreadPoolExecutor) -> int:
-        """One iteration: recover, claim up to capacity, dispatch."""
+        """One iteration: recover, claim up to capacity, dispatch.
+
+        Returns the number of tickets claimed, or -1 when every worker was busy
+        and no claim query ran. Drain mode must not treat that as "no work
+        left", or it would exit with claimable tickets still in the database.
+        """
         self._recover()
         capacity = self._capacity()
         if capacity == 0:
-            return 0
+            return -1
         try:
             tickets = self.claim_once(min(capacity, self.claim_batch_size))
         except Exception as exc:
             logger.error("claim_failed", error=str(exc))
             return 0
         if tickets:
-            logger.info(
-                "tickets_claimed", count=len(tickets), worker_id=self.worker_id
-            )
+            logger.info("tickets_claimed", count=len(tickets), worker_id=self.worker_id)
             self._submit(executor, tickets)
         return len(tickets)
 
@@ -190,7 +197,7 @@ class EvaluationRunner:
                         break
                     if self.drain and claimed == 0 and self._capacity() == self.max_concurrency:
                         break
-                    if claimed == 0:
+                    if claimed <= 0:
                         self._stop.wait(self.poll_interval)
             finally:
                 self._await_inflight()

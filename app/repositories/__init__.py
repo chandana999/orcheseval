@@ -1,15 +1,13 @@
-from app.repositories.config_repository import ConfigRepository
-from app.repositories.dataset_repository import DatasetRepository
 from app.repositories.job_repository import JobRepository
-from app.repositories.payload_repository import PayloadRepository
+from app.repositories.metric_repository import MetricRepository
+from app.repositories.profile_repository import ProfileRepository
 from app.repositories.result_repository import ResultRepository
 from app.repositories.ticket_repository import TicketRepository
 
 __all__ = [
-    "ConfigRepository",
-    "DatasetRepository",
     "JobRepository",
-    "PayloadRepository",
+    "MetricRepository",
+    "ProfileRepository",
     "ResultRepository",
     "TicketRepository",
 ]

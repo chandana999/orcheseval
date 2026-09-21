@@ -8,20 +8,6 @@ from __future__ import annotations
 import enum
 
 
-class DatasetStatus(str, enum.Enum):
-    CREATED = "CREATED"
-    INGESTING = "INGESTING"
-    READY = "READY"
-    FAILED = "FAILED"
-    ARCHIVED = "ARCHIVED"
-
-
-class ConfigStatus(str, enum.Enum):
-    DRAFT = "DRAFT"
-    ACTIVE = "ACTIVE"
-    DEPRECATED = "DEPRECATED"
-
-
 class JobStatus(str, enum.Enum):
     CREATED = "CREATED"
     READY = "READY"

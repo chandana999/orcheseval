@@ -1,30 +1,43 @@
 """Job creation and cancellation.
 
 The API creates durable work and returns; it never evaluates inside the request.
+Paylods are read from EVALUATION_TEMP_ROOT; PostgreSQL stores jobs, tickets, and
+results. Each ticket freezes the exact metric record version used for execution.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 from psycopg import Connection
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.core.metrics import JOBS_CREATED, TICKETS_CREATED
 from app.models.entities import EvaluationJob, EvaluationTicket, JobProgress
 from app.models.enums import CheckType, JobStatus, TicketStatus
-from app.repositories.config_repository import ConfigRepository
-from app.repositories.dataset_repository import DatasetRepository
 from app.repositories.job_repository import JobRepository
-from app.repositories.payload_repository import PayloadRepository
 from app.repositories.ticket_repository import TicketRepository
-from app.services.config_validation import checks_for_job
+from app.services.dataset_folder import (
+    DatasetFolderError,
+    PayloadFile,
+    read_dataset_folder,
+)
+from app.services.payload_validation import PayloadValidationError, validate_payload
+from app.services.profile_resolution import (
+    ProfileResolutionError,
+    extract_evaluation_profile_id,
+    load_profile_metrics,
+)
+
+logger = get_logger(__name__)
 
 
 class JobCreationError(ValueError):
-    pass
+    status_code = 400
 
 
 @dataclass
@@ -32,105 +45,105 @@ class JobCreationResult:
     job: EvaluationJob
     ticket_count: int
     payload_count: int
-    check_ids: list[str]
+    dataset_id: str
+    metric_ids: list[str]
+    profiles: list[str]
+    warnings: list[str]
+    tickets_summary: dict[str, Any]
 
 
-def resolve_payload_ids(
-    conn: Connection,
-    *,
-    dataset_id: uuid.UUID | None,
-    payload_ids: list[uuid.UUID] | None,
-    max_payloads: int | None,
-) -> list[uuid.UUID]:
-    """Select the payloads a job will evaluate, from PostgreSQL only."""
-    payloads = PayloadRepository(conn)
-
-    if payload_ids:
-        found = set(payloads.existing_ids(payload_ids))
-        missing = [str(pid) for pid in payload_ids if pid not in found]
-        if missing:
-            raise JobCreationError(f"unknown payload ids: {', '.join(missing)}")
-        selected = list(dict.fromkeys(payload_ids))
-    elif dataset_id is not None:
-        if DatasetRepository(conn).get(dataset_id) is None:
-            raise JobCreationError(f"dataset {dataset_id} not found")
-        selected = payloads.list_ids_by_dataset(dataset_id)
-        if not selected:
-            raise JobCreationError(f"dataset {dataset_id} has no payloads")
-    else:
-        raise JobCreationError("either dataset_id or payload_ids is required")
-
-    if max_payloads is not None:
-        selected = selected[:max_payloads]
-    return selected
+def _wrap(exc: BaseException) -> JobCreationError:
+    error = JobCreationError(str(exc))
+    error.status_code = int(getattr(exc, "status_code", 400))
+    return error
 
 
 def create_job(
     conn: Connection,
     *,
-    evaluation_config_id: uuid.UUID,
-    dataset_id: uuid.UUID | None = None,
-    payload_ids: list[uuid.UUID] | None = None,
+    dataset_id: str,
     name: str | None = None,
     priority: int | None = None,
     max_attempts: int | None = None,
-    max_payloads: int | None = None,
 ) -> JobCreationResult:
-    """Create a job, snapshot its configuration, and create one ticket per
-    payload x check. Everything happens in the caller's transaction."""
-    config = ConfigRepository(conn).get(evaluation_config_id)
-    if config is None:
-        raise JobCreationError(f"evaluation config {evaluation_config_id} not found")
+    """Create a job and one ticket per payload file x mapped metric.
 
-    snapshot = dict(config.config_json)
-    checks = checks_for_job(snapshot)
-    if not checks:
-        raise JobCreationError("evaluation configuration defines no checks")
-
-    sampling = snapshot.get("sampling") or {}
-    effective_max_payloads = max_payloads or sampling.get("max_payloads")
-    selected_payloads = resolve_payload_ids(
-        conn,
-        dataset_id=dataset_id,
-        payload_ids=payload_ids,
-        max_payloads=effective_max_payloads,
-    )
-
-    # Record provenance of the snapshot so results are traceable to a config version.
-    snapshot["_snapshot"] = {
-        "evaluation_config_id": str(config.id),
-        "config_name": config.name,
-        "config_version": config.version,
-    }
-
-    job = EvaluationJob(
-        id=uuid.uuid4(),
-        name=name,
-        dataset_id=dataset_id,
-        evaluation_config_id=config.id,
-        config_snapshot_json=snapshot,
-        status=JobStatus.CREATED,
-        payload_count=len(selected_payloads),
-        total_tickets=len(selected_payloads) * len(checks),
-        completed_tickets=0,
-        failed_tickets=0,
-        cancelled_tickets=0,
-        not_applicable_tickets=0,
-        created_at=None,
-    )
-    jobs = JobRepository(conn)
-    job = jobs.insert(job)
+    Everything happens in the caller's transaction. A failure before COMMIT
+    leaves no job or ticket rows.
+    """
+    try:
+        folder = read_dataset_folder(dataset_id)
+    except (DatasetFolderError, PayloadValidationError) as exc:
+        raise _wrap(exc) from exc
 
     default_max_attempts = max_attempts or settings.runner_max_attempts
+    profile_cache: dict[str, tuple[Any, list, list[dict[str, Any]]]] = {}
+    prepared: list[tuple[PayloadFile, uuid.UUID, str, list[dict[str, Any]]]] = []
+    warnings = list(folder.warnings)
+    metric_ids: list[str] = []
+    profiles_used: list[str] = []
+
+    for payload_file in folder.payloads:
+        source = payload_file.filename
+        try:
+            report = validate_payload(payload_file.payload)
+            warnings.extend(f"{source}: {w}" for w in report.get("warnings") or [])
+            profile_id = extract_evaluation_profile_id(payload_file.payload, source=source)
+            if profile_id not in profile_cache:
+                profile_cache[profile_id] = load_profile_metrics(conn, profile_id, source=source)
+                profiles_used.append(profile_id)
+            _profile, _records, snapshots = profile_cache[profile_id]
+        except (PayloadValidationError, ProfileResolutionError) as exc:
+            raise _wrap(exc) from exc
+
+        payload_uuid = uuid.uuid4()
+        prepared.append((payload_file, payload_uuid, profile_id, snapshots))
+
     tickets: list[EvaluationTicket] = []
-    for payload_id in selected_payloads:
-        for check in checks:
+    snapshot_doc: dict[str, Any] = {
+        "dataset_id": dataset_id,
+        "payloads": [],
+        "profiles": {},
+    }
+
+    for payload_file, payload_uuid, profile_id, snapshots in prepared:
+        snapshot_doc["payloads"].append(
+            {
+                "file": payload_file.filename,
+                "payload_id": payload_file.payload_id,
+                "evaluation_profile_id": profile_id,
+                "synthetic_payload_id": str(payload_uuid),
+            }
+        )
+        if profile_id not in snapshot_doc["profiles"]:
+            snapshot_doc["profiles"][profile_id] = {
+                "metrics": [
+                    {
+                        "metric_record_id": s["metric_record_id"],
+                        "metric_id": s["metric_id"],
+                        "metric_code": s["metric_code"],
+                        "metric_version_number": s["metric_version_number"],
+                        "check_id": s["definition_payload"]["check_id"],
+                    }
+                    for s in snapshots
+                ]
+            }
+        for frozen in snapshots:
+            check = frozen["definition_payload"]
+            metric_ids.append(frozen["metric_id"])
             tickets.append(
                 EvaluationTicket(
                     id=uuid.uuid4(),
-                    job_id=job.id,
-                    payload_id=payload_id,
-                    evaluation_config_id=config.id,
+                    job_id=uuid.uuid4(),  # replaced after job insert
+                    payload_id=payload_uuid,
+                    source_dataset_id=dataset_id,
+                    source_payload_ref=payload_file.filename,
+                    source_payload_id=payload_file.payload_id,
+                    metric_record_id=uuid.UUID(frozen["metric_record_id"]),
+                    metric_id=frozen["metric_id"],
+                    metric_version_number=int(frozen["metric_version_number"]),
+                    evaluation_profile_id=profile_id,
+                    metric_snapshot_json=frozen,
                     check_id=check["check_id"],
                     check_type=CheckType(check["check_type"]),
                     evaluator=check["evaluator"],
@@ -141,18 +154,60 @@ def create_job(
                 )
             )
 
+    if not tickets:
+        raise JobCreationError("no evaluation tickets could be created from the dataset")
+
+    job = EvaluationJob(
+        id=uuid.uuid4(),
+        name=name,
+        dataset_id=dataset_id,
+        config_snapshot_json=snapshot_doc,
+        status=JobStatus.CREATED,
+        payload_count=len(prepared),
+        total_tickets=len(tickets),
+        completed_tickets=0,
+        failed_tickets=0,
+        cancelled_tickets=0,
+        not_applicable_tickets=0,
+        created_at=None,
+    )
+    jobs = JobRepository(conn)
+    job = jobs.insert(job)
+    for ticket in tickets:
+        ticket.job_id = job.id
+
     created = TicketRepository(conn).bulk_insert(tickets)
     jobs.set_total_tickets(job.id, total=created, status=JobStatus.READY)
     job = jobs.get(job.id)
     assert job is not None
 
+    unique_metrics = list(dict.fromkeys(metric_ids))
+    by_profile: dict[str, int] = defaultdict(int)
+    for ticket in tickets:
+        by_profile[ticket.evaluation_profile_id] += 1
+
     JOBS_CREATED.inc()
     TICKETS_CREATED.inc(created)
+    logger.info(
+        "evaluation_job_created",
+        job_id=str(job.id),
+        dataset_id=dataset_id,
+        payload_count=len(prepared),
+        ticket_count=created,
+        profiles=profiles_used,
+    )
     return JobCreationResult(
         job=job,
         ticket_count=created,
-        payload_count=len(selected_payloads),
-        check_ids=[c["check_id"] for c in checks],
+        payload_count=len(prepared),
+        dataset_id=dataset_id,
+        metric_ids=unique_metrics,
+        profiles=profiles_used,
+        warnings=warnings,
+        tickets_summary={
+            "by_profile": dict(by_profile),
+            "by_status": {"READY": created},
+        },
     )
 
 
@@ -174,9 +229,13 @@ def cancel_job(conn: Connection, job_id: uuid.UUID) -> CancellationResult:
     jobs = JobRepository(conn)
     job = jobs.get_for_update(job_id)
     if job is None:
-        raise JobCreationError(f"job {job_id} not found")
+        error = JobCreationError(f"job {job_id} not found")
+        error.status_code = 404
+        raise error
     if job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL_FAILED}:
-        raise JobCreationError(f"cannot cancel a job in {job.status.value} state")
+        error = JobCreationError(f"cannot cancel a job in {job.status.value} state")
+        error.status_code = 409
+        raise error
 
     jobs.request_cancellation(job_id)
     cancelled = TicketRepository(conn).cancel_unclaimed(job_id)
@@ -192,17 +251,28 @@ def cancel_job(conn: Connection, job_id: uuid.UUID) -> CancellationResult:
 
 
 def retry_failed_tickets(conn: Connection, job_id: uuid.UUID) -> tuple[EvaluationJob, int]:
-    """Reset FAILED tickets to READY so the runner picks them up again."""
+    """Reset FAILED tickets to READY so the runner picks them up again.
+
+    Retries keep the same job, ticket, payload reference, metric record, metric
+    version, and frozen configuration snapshot. The active metric configuration
+    is not re-resolved.
+    """
     jobs = JobRepository(conn)
     job = jobs.get_for_update(job_id)
     if job is None:
-        raise JobCreationError(f"job {job_id} not found")
+        error = JobCreationError(f"job {job_id} not found")
+        error.status_code = 404
+        raise error
     if job.cancellation_requested_at is not None:
-        raise JobCreationError("cannot retry tickets on a cancelled job")
+        error = JobCreationError("cannot retry tickets on a cancelled job")
+        error.status_code = 409
+        raise error
 
     reset_ids = TicketRepository(conn).reset_failed(job_id)
     if not reset_ids:
-        raise JobCreationError("no failed tickets to retry")
+        error = JobCreationError("no failed tickets to retry")
+        error.status_code = 409
+        raise error
     jobs.recompute_progress(job_id)
     updated = jobs.get(job_id)
     assert updated is not None

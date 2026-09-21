@@ -1,4 +1,4 @@
-"""LLM provider contract. Ported from evalforge-local (tenacity retry preserved)."""
+"""LLM provider contract. Ported from eval-orchestrator (tenacity retry preserved)."""
 
 from typing import Any, Protocol
 

@@ -1,4 +1,4 @@
-"""Custom verifiers ported from evalforge-local (regex, contains_all, json_keys,
+"""Custom verifiers ported from eval-orchestrator (regex, contains_all, json_keys,
 length_bounds). Reused by the field comparison evaluator."""
 
 from __future__ import annotations

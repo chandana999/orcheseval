@@ -16,7 +16,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from app import __version__
-from app.api import configs, datasets, health, jobs, payloads
+from app.api import health, jobs
 from app.core.config import settings
 from app.core.database import close_pool, get_pool
 from app.core.logging import get_logger, setup_logging
@@ -45,8 +45,9 @@ app = FastAPI(
     title="eval-platform",
     version=__version__,
     description=(
-        "Database-first agent evaluation platform. PostgreSQL is the durable "
-        "source of truth for payloads, configurations, jobs, tickets, and results."
+        "Database-first agent evaluation platform. Jobs, tickets, and results "
+        "are stored in PostgreSQL. Payloads are read from EVALUATION_TEMP_ROOT; "
+        "evaluation profiles come from each payload's agent_registry."
     ),
     lifespan=lifespan,
 )
@@ -62,13 +63,10 @@ app.add_middleware(
 )
 
 app.include_router(health.router)
-app.include_router(datasets.router)
-app.include_router(payloads.router)
-app.include_router(configs.router)
-app.include_router(jobs.router)
-app.include_router(jobs.tickets_router)
-app.include_router(jobs.results_router)
-app.include_router(jobs.ops_router)
+app.include_router(jobs.router, prefix="/v1")
+app.include_router(jobs.tickets_router, prefix="/v1")
+app.include_router(jobs.results_router, prefix="/v1")
+app.include_router(jobs.ops_router, prefix="/v1")
 
 
 @app.exception_handler(ValueError)
@@ -85,4 +83,5 @@ def root() -> dict:
         "docs": "/docs",
         "health": "/health",
         "durable_store": "postgresql",
+        "evaluation_jobs": "/v1/evaluation-jobs",
     }

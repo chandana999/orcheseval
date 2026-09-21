@@ -1,4 +1,4 @@
-"""OpenAI chat completions provider. Ported from evalforge-local."""
+"""OpenAI chat completions provider. Ported from eval-orchestrator."""
 
 import time
 from typing import Any

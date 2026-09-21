@@ -142,7 +142,7 @@ class FieldComparisonEvaluator(Evaluator):
     """Compare a mapped actual value against a mapped or literal expected value.
 
     Reuses the exact/fuzzy/semantic scoring and the custom verifiers ported from
-    evalforge-local.
+    eval-orchestrator.
 
     Config params::
 

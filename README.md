@@ -1,17 +1,18 @@
 # eval-platform
 
 Database-first evaluation platform for multi-agent systems. PostgreSQL is the
-durable source of truth for every piece of evaluation work: payloads,
-configurations, jobs, tickets, and results all live in tables, and the runner
-takes its work from the database rather than from memory.
+durable source of truth for metric configuration, evaluation profiles, jobs,
+tickets, and results. Payload JSON files are read from a local temporary folder
+identified by `dataset_id`; they are not stored in PostgreSQL.
 
 **Stack:** Python, FastAPI, PostgreSQL, psycopg 3, native parameterized SQL,
 explicit transactions, JSONB, `SELECT ... FOR UPDATE SKIP LOCKED`, local
-filesystem for optional file ingestion.
+filesystem for temporary dataset input.
 
 **Deliberately absent:** SQLAlchemy, Alembic, Redis, RQ, Celery, RabbitMQ, Kafka,
 Pub/Sub, any broker queue, S3, MinIO, boto3, cloud object storage, Docker,
-Docker Compose. There is no authoritative in-memory queue anywhere.
+Docker Compose, dataset tables, payload tables, and external Agent Registry
+lookups. There is no authoritative in-memory queue.
 
 This project is independent of `evalforge-local`, which was used only as a
 read-only reference. Nothing in that folder or its databases is modified.
@@ -24,8 +25,7 @@ read-only reference. Nothing in that folder or its databases is modified.
 
 The application role does not need `CREATEDB` or superuser rights at runtime, so
 database creation is a one-time administrative step. `eval_platform` and
-`eval_platform_test` are dedicated databases; the existing `evalforge_local`
-databases are never used.
+`eval_platform_test` are dedicated databases.
 
 ```powershell
 cd eval-platform
@@ -53,6 +53,19 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+Required PostgreSQL settings (no other database URL scheme is needed):
+
+| Variable | Meaning |
+| --- | --- |
+| `PGHOST` | Hostname (default `localhost`) |
+| `PGPORT` | Port (default `5432`) |
+| `PGDATABASE` | Application database (default `eval_platform`) |
+| `PGUSER` | Application role |
+| `PGPASSWORD` | Application role password |
+
+`DATABASE_URL`, when set, overrides the `PG*` variables. Tests use
+`TEST_PGDATABASE` (`eval_platform_test`).
+
 ### 1.3 Migrate
 
 ```powershell
@@ -65,7 +78,18 @@ Migrations are plain `.sql` files applied once each, inside a transaction, under
 PostgreSQL advisory lock, and recorded with a checksum in `schema_migrations`.
 Editing an applied migration is rejected: add a new file instead.
 
-### 1.4 Run
+### 1.4 Seed a sample profile and dataset
+
+```powershell
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" -U evalorches -d eval_platform -f examples/seed_profile.sql
+New-Item -ItemType Directory -Force temp | Out-Null
+Copy-Item -Recurse examples\dataset-folder-001 temp\dataset-folder-001
+```
+
+`EVALUATION_TEMP_ROOT` defaults to `./temp` (gitignored runtime folder). The
+`dataset_id` in the job request is the folder name under that root.
+
+### 1.5 Run
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload    # API on :8000
@@ -81,21 +105,25 @@ as many runners as you like; `SKIP LOCKED` keeps them from colliding.
 
 | Table | Purpose |
 | --- | --- |
-| `datasets` | Logical grouping of payloads. Metadata only. |
-| `evaluation_payloads` | Complete agent execution payloads in `payload_json` (JSONB), plus indexed `trace_id` / `session_id` / `workflow_id` / `external_payload_id`. |
-| `evaluation_configs` | Versioned evaluation definitions in `config_json` (JSONB), unique on `(name, version)`. |
-| `evaluation_jobs` | One evaluation request, with an immutable `config_snapshot_json` and counters derived from tickets. |
-| `evaluation_tickets` | One payload x one check. The durable unit of work. |
-| `evaluation_results` | Normalized evaluator output, unique on `(job_id, payload_id, check_id)`. |
+| `metric_records` | Versioned metric configuration (`definition_payload` JSONB). Each row is an exact metric version. |
+| `evaluation_profiles` | Named, versioned collection of metrics. `evaluation_profile_id` is the string carried on each payload. |
+| `evaluation_profile_metrics` | Maps a profile to exact `metric_record_id` values. Duplicate mappings are rejected. |
+| `evaluation_jobs` | One evaluation request. `dataset_id` is a folder name, not a database FK. |
+| `evaluation_tickets` | One payload file × one metric. Holds the immutable metric snapshot. |
+| `evaluation_results` | Normalized evaluator output, unique on `ticket_id` (retries upsert). |
 | `schema_migrations` | Migration ledger with checksums. |
 
+The pre-profile tables `datasets`, `evaluation_payloads`, and `evaluation_configs`
+were dropped by migration `011`, along with the `dataset_status` and
+`evaluation_config_status` enums. There is no Dataset API, Payload API, or
+evaluation-config API.
+
 Key indexes: `ix_tickets_claim` (partial, for the claim query), `ix_tickets_lease`
-(partial, for lease recovery), `ix_payloads_payload_json` (GIN),
-`uq_tickets_job_payload_check`, and `uq_results_job_payload_check`.
+(partial, for lease recovery), `uq_tickets_job_payload_metric`, and
+`uq_results_ticket_id`.
 
 ### Lifecycles
 
-- **Dataset:** `CREATED -> INGESTING -> READY` (`FAILED`, `ARCHIVED`)
 - **Job:** `CREATED -> READY -> RUNNING -> COMPLETED | PARTIAL_FAILED | FAILED | CANCELLED`
 - **Ticket:** `READY -> RUNNING -> DONE | RETRY | FAILED | CANCELLED | NOT_APPLICABLE`,
   `RETRY -> RUNNING`, and `FAILED -> READY` for an operator retry.
@@ -106,17 +134,71 @@ committed row, which is locked before the check.
 
 ---
 
-## 3. Evaluation flow
+## 3. Temporary dataset input
 
 ```
-payload ingestion (API or optional file)   ->  evaluation_payloads (JSONB)
-evaluation configuration                   ->  evaluation_configs (JSONB, versioned)
-job creation                               ->  evaluation_jobs + evaluation_tickets
-                                               (one ticket per payload x check)
-runner: claim (FOR UPDATE SKIP LOCKED)     ->  ticket RUNNING with a lease
-        context resolver                   ->  normalized evaluator input
-        evaluator                          ->  normalized output
-        persist                            ->  evaluation_results (upsert)
+{EVALUATION_TEMP_ROOT}/
+└── dataset-folder-001/
+    ├── payload_001.json
+    ├── payload_002.json
+    └── payload_003.json
+```
+
+`POST /v1/evaluation-jobs` with `{"dataset_id": "dataset-folder-001"}` resolves:
+
+```
+{EVALUATION_TEMP_ROOT}/dataset-folder-001/
+```
+
+Rules:
+
+- `dataset_id` is a single folder name. Path separators and `..` are rejected.
+- The resolved path must stay inside `EVALUATION_TEMP_ROOT`.
+- Supported files are `*.json` objects. Other extensions are skipped (warning).
+- Invalid JSON fails job creation with HTTP 400; no job or ticket rows are written.
+- An empty folder (or a folder with no `.json` files) fails with HTTP 400.
+- A missing folder fails with HTTP 404.
+- Payloads are not copied into PostgreSQL.
+
+At execution time the runner re-reads the same file. If it was deleted or moved,
+the ticket fails permanently with `SOURCE_PAYLOAD_MISSING`.
+
+Each payload must include:
+
+```json
+{
+  "agent_registry": {
+    "agent_id": "support-triage-agent",
+    "agent_name": "Support Triage Agent",
+    "agent_version": "1.0",
+    "evaluation_profile_id": "agent-response-quality-v1"
+  }
+}
+```
+
+The profile is taken only from `payload.agent_registry.evaluation_profile_id`.
+It is not inferred from producer, workflow, agent name, or spans. Each payload
+is resolved independently; payloads in the same folder may use different
+profiles.
+
+---
+
+## 4. Evaluation flow
+
+```
+temp folder (dataset_id)                   ->  read *.json payloads
+payload.agent_registry.evaluation_profile_id
+                                          ->  evaluation_profiles (PostgreSQL)
+profile mappings                          ->  metric_records (exact versions)
+job creation (one transaction)            ->  evaluation_jobs + evaluation_tickets
+                                               (one ticket per payload × metric,
+                                                snapshot frozen on the ticket)
+runner: claim (FOR UPDATE SKIP LOCKED)    ->  ticket RUNNING with a lease
+        load payload from temp folder
+        load check from ticket snapshot
+        context resolver                  ->  normalized evaluator input
+        evaluator                         ->  normalized output
+        persist                           ->  evaluation_results (upsert on ticket_id)
                                                ticket DONE/RETRY/FAILED/NOT_APPLICABLE
                                                job counters recomputed from tickets
 ```
@@ -125,13 +207,17 @@ The API never evaluates inside a request: it creates durable rows and returns.
 Job counters are always recomputed by aggregating ticket rows, never incremented
 from runner memory, so a crashed runner cannot corrupt them.
 
+Retries keep the same job ID, ticket ID, payload file reference, metric record,
+metric version, and configuration snapshot. They do not re-resolve the currently
+active metric configuration.
+
 ---
 
-## 4. Context resolver
+## 5. Context resolver
 
-Evaluators never dig through raw payloads. Each check declares an `input_mapping`,
-and the resolver turns the stored payload into the exact values the evaluator
-needs, recording how each value was found.
+Evaluators never dig through raw payloads. Each metric's `definition_payload`
+declares an `input_mapping`, and the resolver turns the source payload into the
+exact values the evaluator needs, recording how each value was found.
 
 ```json
 "input_mapping": {
@@ -165,7 +251,7 @@ payloads evaluable. Payloads are not assumed to contain the same agents.
 
 ---
 
-## 5. Evaluators
+## 6. Evaluators
 
 | Evaluator | Type | What it checks |
 | --- | --- | --- |
@@ -178,7 +264,7 @@ payloads evaluable. Payloads are not assumed to contain the same agents.
 | `field_comparison` | deterministic | Actual vs expected using exact/fuzzy/semantic or a custom verifier (`regex`, `contains_all`, `json_keys`, `length_bounds`). |
 | `llm_judge` | LLM | Configurable rubric: faithfulness, clarity, completeness, appropriateness, policy compliance, resolution quality. |
 
-`GET /api/v1/evaluators` lists them at runtime. Add one by subclassing
+`GET /v1/evaluators` lists them at runtime. Add one by subclassing
 `Evaluator` and registering it in `app/evaluators/registry.py`.
 
 The judge is configuration-driven: `criteria`, optional `prompt_template`,
@@ -189,44 +275,26 @@ attempts remain), never a silent failure.
 
 ---
 
-## 6. API
+## 7. API
 
 Authentication: `X-API-Key` header (set `API_KEY`; optional when `APP_ENV` is a
 development value).
 
-**Datasets and payloads**
-
-| Method | Path | Notes |
-| --- | --- | --- |
-| POST | `/api/v1/datasets` | Create a dataset, optionally with payloads. No file involved. |
-| POST | `/api/v1/datasets/upload` | Optional `.json` / `.jsonl` / `.ndjson` ingestion. |
-| GET | `/api/v1/datasets` · `/{id}` | List / fetch. |
-| POST | `/api/v1/datasets/{id}/payloads` | Add payloads to an existing dataset. |
-| GET | `/api/v1/datasets/{id}/export` | Stream payloads back as JSONL from PostgreSQL. |
-| POST | `/api/v1/payloads` · `/bulk` | Insert one or many complete payloads. |
-| GET | `/api/v1/payloads` · `/{id}` | Filter by dataset, trace, or session. |
-
-**Configurations**
-
-| Method | Path | Notes |
-| --- | --- | --- |
-| POST | `/api/v1/evaluation-configs` | Validate, normalize, and store a new version. |
-| POST | `/api/v1/evaluation-configs/validate` | Dry-run validation. |
-| GET | `/api/v1/evaluation-configs` · `/{id}` | List / fetch. |
-| PATCH | `/api/v1/evaluation-configs/{id}/status` | `DRAFT` / `ACTIVE` / `DEPRECATED`. Checks stay immutable per version. |
+All routes are served under a single `/v1` prefix. The dataset, payload, and
+evaluation-config endpoints no longer exist in any form.
 
 **Jobs, tickets, results**
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| POST | `/api/v1/evaluation-jobs` | Create job + tickets in one transaction. |
-| GET | `/api/v1/evaluation-jobs` · `/{id}` | Detail includes live ticket counts and the config snapshot. |
-| POST | `/api/v1/evaluation-jobs/{id}/cancel` | Cancel pending work; running tickets settle as `CANCELLED`. |
-| POST | `/api/v1/evaluation-jobs/{id}/retry-failed` | Reset `FAILED` tickets to `READY`. |
-| GET | `/api/v1/evaluation-jobs/{id}/tickets` · `/tickets/summary` | Ticket inspection. |
-| GET | `/api/v1/evaluation-jobs/{id}/results` · `/results/summary` | Results and PostgreSQL-side aggregates. |
-| GET | `/api/v1/tickets/{id}` · `/api/v1/results/{id}` | Single item with input snapshot. |
-| POST | `/api/v1/operations/recover-tickets` | Manually trigger the recovery sweep. |
+| POST | `/v1/evaluation-jobs` | Create job + tickets in one transaction from a temp folder. |
+| GET | `/v1/evaluation-jobs` · `/{id}` | Detail includes live ticket counts and the job snapshot. |
+| POST | `/v1/evaluation-jobs/{id}/cancel` | Cancel pending work; running tickets settle as `CANCELLED`. |
+| POST | `/v1/evaluation-jobs/{id}/retry-failed` | Reset `FAILED` tickets to `READY` (same snapshot). |
+| GET | `/v1/evaluation-jobs/{id}/tickets` · `/tickets/summary` | Ticket inspection. |
+| GET | `/v1/evaluation-jobs/{id}/results` · `/results/summary` | Results and PostgreSQL-side aggregates. |
+| GET | `/v1/tickets/{id}` · `/v1/results/{id}` | Single item, including the frozen metric snapshot. |
+| POST | `/v1/operations/recover-tickets` | Manually trigger the recovery sweep. |
 | GET | `/health` · `/health/live` · `/health/ready` · `/metrics` | Probes and Prometheus metrics. |
 
 ### Walkthrough
@@ -234,31 +302,39 @@ development value).
 ```powershell
 $h = @{ "X-API-Key" = "change-me"; "Content-Type" = "application/json" }
 
-# 1. store a payload inside a dataset
-$ds = Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/datasets -Headers $h -Body (@{
-  name = "support-traces"
-  payloads = @((Get-Content examples/payload.json -Raw | ConvertFrom-Json))
-} | ConvertTo-Json -Depth 20)
+# 1. seed metrics + profile (once)
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" -U evalorches -d eval_platform -f examples/seed_profile.sql
 
-# 2. store an evaluation configuration
-$cfg = Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/evaluation-configs -Headers $h `
-  -Body (Get-Content examples/evaluation_config.json -Raw)
+# 2. copy sample payloads into the temp root
+New-Item -ItemType Directory -Force temp | Out-Null
+Copy-Item -Recurse examples\dataset-folder-001 temp\dataset-folder-001
 
 # 3. create a job (returns immediately; tickets are durable)
-$job = Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/evaluation-jobs -Headers $h -Body (@{
-  evaluation_config_id = $cfg.id
-  dataset_id = $ds.dataset_id
-  name = "nightly"
+$job = Invoke-RestMethod -Method Post -Uri http://localhost:8000/v1/evaluation-jobs -Headers $h -Body (@{
+  dataset_id = "dataset-folder-001"
 } | ConvertTo-Json)
 
 # 4. let the runner drain the queue, then read results
 .\.venv\Scripts\python.exe -m runner.main --drain
-Invoke-RestMethod -Uri "http://localhost:8000/api/v1/evaluation-jobs/$($job.job.id)/results/summary" -Headers $h
+Invoke-RestMethod -Uri "http://localhost:8000/v1/evaluation-jobs/$($job.job.id)/results/summary" -Headers $h
 ```
+
+Request body:
+
+```json
+{
+  "dataset_id": "dataset-folder-001"
+}
+```
+
+The caller does not supply a payload id, a dataset database id, an evaluation
+configuration id, or a profile id. The profile comes from each payload.
+
+Example: 3 payloads × 4 metrics on `agent-response-quality-v1` → 12 tickets.
 
 ---
 
-## 7. Runner
+## 8. Runner
 
 ```powershell
 python -m runner.main                       # long-running
@@ -269,6 +345,8 @@ python -m runner.main --concurrency 8 --batch-size 10
 - Claims a batch inside one transaction with `FOR UPDATE SKIP LOCKED`, setting
   `RUNNING`, `worker_id`, `attempt_count`, and `lease_expires_at`.
 - Executes with a bounded thread pool. LLM calls happen outside any transaction.
+- Loads the source payload from `{EVALUATION_TEMP_ROOT}/{dataset_id}/{file}`.
+- Uses the ticket's `metric_snapshot_json`, never the currently active metric row.
 - Persists the result and settles the ticket in a single transaction, then
   recomputes job progress from ticket rows.
 - Sweeps for recovery every `RUNNER_RECOVERY_INTERVAL_SECONDS`: expired leases go
@@ -283,24 +361,27 @@ python -m runner.main --concurrency 8 --batch-size 10
 | Class | Examples | Behaviour |
 | --- | --- | --- |
 | Transient | timeout, connection error, 429, 5xx | `RETRY` with backoff `RUNNER_RETRY_BACKOFF_SECONDS`, up to the ticket's `max_attempts`, then `FAILED` with `TRANSIENT_ATTEMPTS_EXHAUSTED`. |
-| Permanent | unknown evaluator, invalid check config, 4xx | `FAILED` immediately, with an `ERROR` result for traceability. |
+| Permanent | unknown evaluator, invalid check config, 4xx, missing source payload | `FAILED` immediately, with an `ERROR` result for traceability. |
 | Missing context | unresolvable mapping | `NOT_APPLICABLE` or `FAILED` per the check's policy. |
 | Crash | runner killed | Lease expires; the sweep requeues the ticket. |
+| Missing source file | payload deleted after job creation | Ticket `FAILED` with `SOURCE_PAYLOAD_MISSING`. Not retried. |
 
-A retried ticket upserts onto the same `(job_id, payload_id, check_id)` row, so
-retries never produce duplicate results.
+A retried ticket upserts onto the same `ticket_id` row, so retries never produce
+duplicate results and always reuse the frozen snapshot.
 
 ---
 
-## 8. Configuration
+## 9. Configuration
 
 All settings come from the environment (see `.env.example`). Notable ones:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PGDATABASE` / `TEST_PGDATABASE` | `eval_platform` / `eval_platform_test` | Dedicated databases. |
+| `PGHOST` / `PGPORT` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` | localhost / 5432 / `eval_platform` / … | PostgreSQL connection. |
+| `TEST_PGDATABASE` | `eval_platform_test` | Pytest database. |
 | `PGSCHEMA` | `public` | Schema inside that database. |
 | `DATABASE_URL` | — | Overrides the `PG*` variables when set. |
+| `EVALUATION_TEMP_ROOT` | `./temp` | Root of dataset folders (`dataset_id` is a child directory). |
 | `DB_POOL_MIN_SIZE` / `DB_POOL_MAX_SIZE` | 1 / 20 | psycopg pool bounds. |
 | `RUNNER_MAX_CONCURRENCY` | 4 | Tickets in flight per runner. |
 | `RUNNER_CLAIM_BATCH_SIZE` | 5 | Tickets per claim. |
@@ -308,11 +389,10 @@ All settings come from the environment (see `.env.example`). Notable ones:
 | `RUNNER_MAX_ATTEMPTS` | 3 | Default attempts per ticket. |
 | `RUNNER_RETRY_BACKOFF_SECONDS` | `30,60,120` | Backoff per attempt. |
 | `DEFAULT_ON_MISSING_CONTEXT` | `not_applicable` | Platform-wide missing-context policy. |
-| `LOCAL_STORAGE_ROOT` | `./data/storage` | Archive for uploads and exports only. |
 
 ---
 
-## 9. Tests
+## 10. Tests
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
@@ -322,13 +402,14 @@ Tests run against the real `eval_platform_test` database (migrations are applied
 automatically) and skip with a clear message if it does not exist yet. Nothing at
 the database layer is mocked: locking, transactions, enums, and JSONB behaviour are
 what is being verified. Coverage includes context resolution, every evaluator,
-configuration validation, the migration ledger, the full API surface, concurrent
-claiming with two live connections, retry and backoff, lease recovery,
-cancellation mid-flight, result idempotency, and two runners sharing one job.
+metric definition validation, the migration ledger, job creation from temp folders,
+profile extraction, concurrent claiming with two live connections, retry and
+backoff, lease recovery, cancellation mid-flight, result idempotency, and two
+runners sharing one job.
 
 ---
 
-## 10. Layout
+## 11. Layout
 
 ```
 app/
@@ -336,28 +417,12 @@ app/
   db/            migration runner + migrations/*.sql
   models/        dataclass entities, enums, ticket state machine
   repositories/  hand-written parameterized SQL per table
-  services/      ingestion, validation, context resolver, job/ticket/evaluation/recovery
+  services/      temp-folder input, profile resolution, job/ticket/evaluation/recovery
   evaluators/    contract, registry, deterministic set, LLM judge + providers
   api/           FastAPI routers
   schemas/       pydantic request/response models
 runner/          claim loop, concurrency, recovery, graceful shutdown
 scripts/         setup_databases.sql|.py, migrate.py, check_connection.py
-examples/        sample payload and evaluation configuration
+examples/        seed_profile.sql + sample dataset-folder-001 payloads
 tests/           pytest suite against real PostgreSQL
 ```
-
-## 11. Reused from evalforge-local
-
-Ported with minimal changes: the psycopg pool and transaction helpers, the plain
-SQL migration runner (advisory lock + checksum ledger), the repository pattern,
-local filesystem storage, the LLM provider abstraction (OpenAI, Anthropic, Ollama,
-with tenacity retry), the scoring primitives (`normalize`, exact, fuzzy, semantic,
-hash/OpenAI embeddings), the custom verifiers (`regex`, `contains_all`,
-`json_keys`, `length_bounds`), cost estimation, structlog setup, and the
-Prometheus/health/API-key conventions.
-
-Replaced by design: the record-index-driven run model (`eval_runs`,
-`eval_results`, dataset files read at evaluation time) gives way to payload- and
-check-addressed tickets with PostgreSQL as the only source of truth; file storage
-becomes optional provenance; pandas-based CSV/JSONL record validation becomes
-structural payload validation in the standard library.

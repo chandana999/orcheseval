@@ -6,6 +6,7 @@ behaviour are the things under test.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from pathlib import Path
@@ -18,8 +19,8 @@ os.environ.setdefault("APP_ENV", "test")
 os.environ["PGDATABASE"] = os.environ.get("TEST_PGDATABASE", "eval_platform_test")
 os.environ.pop("DATABASE_URL", None)
 os.environ["API_KEY"] = "test-api-key"
-os.environ["LOCAL_STORAGE_ROOT"] = str(
-    (Path(__file__).resolve().parents[1] / "data" / "storage-test")
+os.environ["EVALUATION_TEMP_ROOT"] = str(
+    (Path(__file__).resolve().parents[1] / "data" / "temp-test")
 )
 os.environ["RUNNER_RETRY_BACKOFF_SECONDS"] = "0,0,0"
 os.environ["RATE_LIMIT"] = "10000/minute"
@@ -29,16 +30,22 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.core import database  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.db.migration_runner import upgrade  # noqa: E402
+from app.models.entities import EvaluationProfile, MetricRecord  # noqa: E402
+from app.models.enums import CheckType  # noqa: E402
+from app.repositories.metric_repository import MetricRepository  # noqa: E402
+from app.repositories.profile_repository import ProfileRepository  # noqa: E402
 
 API_HEADERS = {"X-API-Key": "test-api-key"}
+
+DEFAULT_PROFILE_ID = "agent-response-quality-v1"
 
 TABLES = [
     "evaluation_results",
     "evaluation_tickets",
     "evaluation_jobs",
-    "evaluation_configs",
-    "evaluation_payloads",
-    "datasets",
+    "evaluation_profile_metrics",
+    "evaluation_profiles",
+    "metric_records",
 ]
 
 
@@ -75,6 +82,12 @@ def conn():
 
 
 @pytest.fixture
+def temp_root(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setattr(settings, "evaluation_temp_root", str(tmp_path))
+    return tmp_path
+
+
+@pytest.fixture
 def client() -> TestClient:
     from app.main import app
 
@@ -83,7 +96,6 @@ def client() -> TestClient:
         yield test_client
 
 
-# --------------------------------------------------------------------- payloads
 def make_payload(
     *,
     payload_id: str | None = None,
@@ -92,6 +104,8 @@ def make_payload(
     include_summarizer: bool = True,
     tool_response: bool = True,
     spans_out_of_order: bool = False,
+    evaluation_profile_id: str | None = DEFAULT_PROFILE_ID,
+    include_agent_registry: bool = True,
 ) -> dict[str, Any]:
     """A representative multi-agent execution payload."""
     identifier = payload_id or f"pl-{uuid.uuid4().hex[:8]}"
@@ -134,7 +148,7 @@ def make_payload(
     if spans_out_of_order:
         spans = list(reversed(spans))
 
-    return {
+    payload: dict[str, Any] = {
         "payload_metadata": {"payload_id": identifier, "version": "2026-01"},
         "trace_data": {
             "trace_id": f"tr-{identifier}",
@@ -152,6 +166,40 @@ def make_payload(
         "spans": spans,
         "resolved_configuration": {"model": "gpt-4o-mini", "temperature": 0},
     }
+    if include_agent_registry:
+        payload["agent_registry"] = {
+            "agent_id": "support-triage-agent",
+            "agent_name": "Support Triage Agent",
+            "agent_version": "1.0",
+            "evaluation_profile_id": evaluation_profile_id,
+        }
+    return payload
+
+
+DETERMINISTIC_CHECKS: list[dict[str, Any]] = [
+    {
+        "check_id": "summary_present",
+        "evaluator": "required_fields",
+        "input_mapping": {"summary": "summarizer.output.summary"},
+        "params": {"fields": ["summary"]},
+        "priority": 5,
+    },
+    {
+        "check_id": "workflow_sequence",
+        "evaluator": "workflow_order",
+        "input_mapping": {"spans": "spans"},
+        "params": {
+            "expected_order": ["classifier", "validator", "summarizer"],
+            "mode": "subsequence",
+        },
+    },
+    {
+        "check_id": "policy_tool_called",
+        "evaluator": "tool_calls",
+        "input_mapping": {"tool_calls": "validator.tool_calls"},
+        "params": {"expected_tools": ["policy_lookup"], "require_response": True},
+    },
+]
 
 
 DETERMINISTIC_CONFIG: dict[str, Any] = {
@@ -160,30 +208,7 @@ DETERMINISTIC_CONFIG: dict[str, Any] = {
     "target_agents": ["classifier", "validator", "summarizer"],
     "workflow_order": ["classifier", "validator", "summarizer"],
     "on_missing_context": "not_applicable",
-    "checks": [
-        {
-            "check_id": "summary_present",
-            "evaluator": "required_fields",
-            "input_mapping": {"summary": "summarizer.output.summary"},
-            "params": {"fields": ["summary"]},
-            "priority": 5,
-        },
-        {
-            "check_id": "workflow_sequence",
-            "evaluator": "workflow_order",
-            "input_mapping": {"spans": "spans"},
-            "params": {
-                "expected_order": ["classifier", "validator", "summarizer"],
-                "mode": "subsequence",
-            },
-        },
-        {
-            "check_id": "policy_tool_called",
-            "evaluator": "tool_calls",
-            "input_mapping": {"tool_calls": "validator.tool_calls"},
-            "params": {"expected_tools": ["policy_lookup"], "require_response": True},
-        },
-    ],
+    "checks": DETERMINISTIC_CHECKS,
 }
 
 
@@ -194,38 +219,103 @@ def deterministic_config() -> dict[str, Any]:
     return copy.deepcopy(DETERMINISTIC_CONFIG)
 
 
-@pytest.fixture
-def seeded_job(client: TestClient, deterministic_config: dict[str, Any]):
-    """Create a config, a dataset with two payloads, and a job over them."""
-    config_response = client.post(
-        "/api/v1/evaluation-configs",
-        json={"name": f"cfg-{uuid.uuid4().hex[:6]}", "config": deterministic_config},
-    )
-    assert config_response.status_code == 201, config_response.text
-    config = config_response.json()
+def write_dataset(root: Path, dataset_id: str, payloads: list[dict[str, Any]]) -> Path:
+    folder = root / dataset_id
+    folder.mkdir(parents=True, exist_ok=True)
+    for index, payload in enumerate(payloads, start=1):
+        (folder / f"payload_{index:03d}.json").write_text(json.dumps(payload), encoding="utf-8")
+    return folder
 
-    dataset_response = client.post(
-        "/api/v1/datasets",
-        json={
-            "name": "support-traces",
-            "payloads": [make_payload(), make_payload(category="technical")],
-        },
+
+def seed_metric(
+    conn,
+    check: dict[str, Any],
+    *,
+    metric_id: str | None = None,
+    version: int = 1,
+    active: bool = True,
+) -> MetricRecord:
+    check_id = check["check_id"]
+    evaluator = check.get("evaluator") or (
+        "llm_judge"
+        if str(check.get("check_type", "")).upper() == "LLM_JUDGE"
+        else "required_fields"
     )
-    assert dataset_response.status_code == 201, dataset_response.text
-    dataset = dataset_response.json()
+    metric_type = (
+        CheckType.LLM_JUDGE.value
+        if evaluator == "llm_judge" or str(check.get("check_type", "")).upper() == "LLM_JUDGE"
+        else CheckType.DETERMINISTIC.value
+    )
+    record = MetricRecord(
+        metric_record_id=uuid.uuid4(),
+        metric_id=metric_id or check_id,
+        metric_code=check_id,
+        metric_name=check_id.replace("_", " "),
+        metric_desc=check.get("description"),
+        metric_type=metric_type,
+        metric_version_number=version,
+        definition_payload=dict(check),
+        default_threshold_operator=None,
+        llm_model_name=None,
+        llm_model_version=None,
+        llm_deployed_id=None,
+        is_active_indicator=active,
+        previous_metric_record_id=None,
+        change_summary=None,
+    )
+    return MetricRepository(conn).insert(record)
+
+
+def seed_profile(
+    conn,
+    records: list[MetricRecord],
+    *,
+    profile_id: str = DEFAULT_PROFILE_ID,
+    active: bool = True,
+    name: str | None = None,
+) -> EvaluationProfile:
+    profiles = ProfileRepository(conn)
+    profile = profiles.insert(
+        EvaluationProfile(
+            evaluation_profile_id=profile_id,
+            name=name or profile_id,
+            version=1,
+            description=None,
+            is_active=active,
+        )
+    )
+    for index, record in enumerate(records):
+        profiles.add_metric(
+            profile_id=profile.id,
+            metric_record_id=record.metric_record_id,
+            metric_id=record.metric_id,
+            execution_order=index,
+        )
+    return profile
+
+
+def seed_default_profile(conn, checks: list[dict[str, Any]] | None = None) -> list[MetricRecord]:
+    records = [seed_metric(conn, check) for check in (checks or DETERMINISTIC_CHECKS)]
+    seed_profile(conn, records)
+    return records
+
+
+@pytest.fixture
+def seeded_job(client: TestClient, temp_root: Path, deterministic_config: dict[str, Any]):
+    """Create a profile with three metrics, two payload files, and a job over them."""
+    with database.transaction() as conn:
+        seed_default_profile(conn, deterministic_config["checks"])
+
+    dataset_id = f"dataset-{uuid.uuid4().hex[:8]}"
+    write_dataset(temp_root, dataset_id, [make_payload(), make_payload(category="technical")])
 
     job_response = client.post(
-        "/api/v1/evaluation-jobs",
-        json={
-            "evaluation_config_id": config["id"],
-            "dataset_id": dataset["dataset_id"],
-            "name": "nightly",
-        },
+        "/v1/evaluation-jobs", json={"dataset_id": dataset_id, "name": "nightly"}
     )
     assert job_response.status_code == 201, job_response.text
     return {
-        "config": config,
-        "dataset": dataset,
+        "dataset_id": dataset_id,
+        "temp_root": temp_root,
         "job": job_response.json()["job"],
         "created": job_response.json(),
     }

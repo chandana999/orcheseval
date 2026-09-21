@@ -2,6 +2,8 @@
 
 Creating a job creates durable tickets and returns immediately. No evaluation
 runs inside an HTTP request; the runner picks the work up from PostgreSQL.
+
+Mounted under `/v1`.
 """
 
 from __future__ import annotations
@@ -41,45 +43,50 @@ from app.services.job_service import (
 )
 from app.services.recovery_service import recover_abandoned_tickets
 
-router = APIRouter(prefix="/api/v1/evaluation-jobs", tags=["evaluation-jobs"])
+router = APIRouter(tags=["evaluation-jobs"])
 
 
-@router.post("", response_model=EvaluationJobCreateResponse, status_code=201)
+def _http_error(exc: JobCreationError) -> HTTPException:
+    return HTTPException(status_code=getattr(exc, "status_code", 400), detail=str(exc))
+
+
+@router.post("/evaluation-jobs", response_model=EvaluationJobCreateResponse, status_code=201)
 def create_evaluation_job(
     body: EvaluationJobCreate,
     conn: DbConnection,
     _api_key: ApiKey,
 ) -> EvaluationJobCreateResponse:
-    """Create a job plus one ticket per payload x check, in one transaction."""
+    """Create a job plus one ticket per payload x metric, in one transaction."""
     try:
         with conn.transaction():
             result = create_job(
                 conn,
-                evaluation_config_id=body.evaluation_config_id,
                 dataset_id=body.dataset_id,
-                payload_ids=body.payload_ids,
                 name=body.name,
                 priority=body.priority,
                 max_attempts=body.max_attempts,
-                max_payloads=body.max_payloads,
             )
     except JobCreationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _http_error(exc) from exc
 
     return EvaluationJobCreateResponse(
         job=EvaluationJobResponse.model_validate(result.job),
         ticket_count=result.ticket_count,
         payload_count=result.payload_count,
-        check_ids=result.check_ids,
+        dataset_id=result.dataset_id,
+        metric_ids=result.metric_ids,
+        profiles=result.profiles,
+        tickets_summary=result.tickets_summary,
+        warnings=result.warnings,
     )
 
 
-@router.get("", response_model=EvaluationJobListResponse)
+@router.get("/evaluation-jobs", response_model=EvaluationJobListResponse)
 def list_jobs(
     conn: DbConnection,
     _api_key: ApiKey,
     status: JobStatus | None = None,
-    dataset_id: uuid.UUID | None = None,
+    dataset_id: str | None = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> EvaluationJobListResponse:
@@ -91,10 +98,8 @@ def list_jobs(
     )
 
 
-@router.get("/{job_id}", response_model=EvaluationJobDetailResponse)
-def get_job(
-    job_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey
-) -> EvaluationJobDetailResponse:
+@router.get("/evaluation-jobs/{job_id}", response_model=EvaluationJobDetailResponse)
+def get_job(job_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey) -> EvaluationJobDetailResponse:
     """Job detail with counters derived from durable ticket rows."""
     job = JobRepository(conn).get(job_id)
     if job is None:
@@ -107,7 +112,7 @@ def get_job(
     )
 
 
-@router.post("/{job_id}/cancel", response_model=JobCancellationResponse)
+@router.post("/evaluation-jobs/{job_id}/cancel", response_model=JobCancellationResponse)
 def cancel_evaluation_job(
     job_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey
 ) -> JobCancellationResponse:
@@ -117,8 +122,7 @@ def cancel_evaluation_job(
         with conn.transaction():
             result = cancel_job(conn, job_id)
     except JobCreationError as exc:
-        status_code = 404 if "not found" in str(exc) else 409
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        raise _http_error(exc) from exc
 
     return JobCancellationResponse(
         job=EvaluationJobResponse.model_validate(result.job),
@@ -131,36 +135,37 @@ def cancel_evaluation_job(
     )
 
 
-@router.post("/{job_id}/retry-failed", response_model=RetryFailedResponse)
-def retry_failed(
-    job_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey
-) -> RetryFailedResponse:
-    """Reset FAILED tickets to READY so the runner retries them."""
+@router.post("/evaluation-jobs/{job_id}/retry-failed", response_model=RetryFailedResponse)
+def retry_failed(job_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey) -> RetryFailedResponse:
+    """Reset FAILED tickets to READY so the runner retries them with the same snapshot."""
     try:
         with conn.transaction():
             job, count = retry_failed_tickets(conn, job_id)
     except JobCreationError as exc:
-        status_code = 404 if "not found" in str(exc) else 409
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-    return RetryFailedResponse(
-        job=EvaluationJobResponse.model_validate(job), reset_count=count
-    )
+        raise _http_error(exc) from exc
+    return RetryFailedResponse(job=EvaluationJobResponse.model_validate(job), reset_count=count)
 
 
-@router.get("/{job_id}/tickets", response_model=TicketListResponse)
+@router.get("/evaluation-jobs/{job_id}/tickets", response_model=TicketListResponse)
 def list_job_tickets(
     job_id: uuid.UUID,
     conn: DbConnection,
     _api_key: ApiKey,
     status: TicketStatus | None = None,
     check_id: str | None = None,
+    metric_id: str | None = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> TicketListResponse:
     if JobRepository(conn).get(job_id) is None:
         raise HTTPException(status_code=404, detail="Evaluation job not found")
     total, items = TicketRepository(conn).list_by_job(
-        job_id, status=status, check_id=check_id, limit=limit, offset=offset
+        job_id,
+        status=status,
+        check_id=check_id,
+        metric_id=metric_id,
+        limit=limit,
+        offset=offset,
     )
     return TicketListResponse(
         total=total,
@@ -170,7 +175,7 @@ def list_job_tickets(
     )
 
 
-@router.get("/{job_id}/tickets/summary", response_model=TicketSummaryResponse)
+@router.get("/evaluation-jobs/{job_id}/tickets/summary", response_model=TicketSummaryResponse)
 def ticket_summary(
     job_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey
 ) -> TicketSummaryResponse:
@@ -181,7 +186,7 @@ def ticket_summary(
     )
 
 
-@router.get("/{job_id}/results", response_model=ResultListResponse)
+@router.get("/evaluation-jobs/{job_id}/results", response_model=ResultListResponse)
 def list_job_results(
     job_id: uuid.UUID,
     conn: DbConnection,
@@ -189,6 +194,8 @@ def list_job_results(
     status: ResultStatus | None = None,
     check_id: str | None = None,
     payload_id: uuid.UUID | None = None,
+    source_payload_ref: str | None = None,
+    metric_id: str | None = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> ResultListResponse:
@@ -199,6 +206,8 @@ def list_job_results(
         status=status,
         check_id=check_id,
         payload_id=payload_id,
+        source_payload_ref=source_payload_ref,
+        metric_id=metric_id,
         limit=limit,
         offset=offset,
     )
@@ -210,7 +219,7 @@ def list_job_results(
     )
 
 
-@router.get("/{job_id}/results/summary")
+@router.get("/evaluation-jobs/{job_id}/results/summary")
 def result_summary(job_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey) -> dict:
     """Pass rates and average scores aggregated in PostgreSQL."""
     job = JobRepository(conn).get(job_id)
@@ -222,11 +231,10 @@ def result_summary(job_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey) -> d
     return summary
 
 
-# --------------------------------------------------------------- single items
-tickets_router = APIRouter(prefix="/api/v1/tickets", tags=["tickets"])
+tickets_router = APIRouter(tags=["tickets"])
 
 
-@tickets_router.get("/{ticket_id}", response_model=EvaluationTicketDetailResponse)
+@tickets_router.get("/tickets/{ticket_id}", response_model=EvaluationTicketDetailResponse)
 def get_ticket(
     ticket_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey
 ) -> EvaluationTicketDetailResponse:
@@ -236,10 +244,10 @@ def get_ticket(
     return EvaluationTicketDetailResponse.model_validate(ticket)
 
 
-results_router = APIRouter(prefix="/api/v1/results", tags=["results"])
+results_router = APIRouter(tags=["results"])
 
 
-@results_router.get("/{result_id}", response_model=EvaluationResultDetailResponse)
+@results_router.get("/results/{result_id}", response_model=EvaluationResultDetailResponse)
 def get_result(
     result_id: uuid.UUID, conn: DbConnection, _api_key: ApiKey
 ) -> EvaluationResultDetailResponse:
@@ -249,11 +257,10 @@ def get_result(
     return EvaluationResultDetailResponse.model_validate(result)
 
 
-# ----------------------------------------------------------------- operations
-ops_router = APIRouter(prefix="/api/v1/operations", tags=["operations"])
+ops_router = APIRouter(tags=["operations"])
 
 
-@ops_router.post("/recover-tickets", response_model=RecoveryResponse)
+@ops_router.post("/operations/recover-tickets", response_model=RecoveryResponse)
 def recover_tickets(
     conn: DbConnection,
     _api_key: ApiKey,

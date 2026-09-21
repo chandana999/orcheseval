@@ -1,14 +1,17 @@
 """Execution of a single evaluation ticket.
 
-Flow, all of it PostgreSQL-driven:
+Flow, all of it PostgreSQL-driven for durable state:
 
-    load payload + config snapshot from PostgreSQL
+    load ticket snapshot from PostgreSQL
+        -> load source payload from EVALUATION_TEMP_ROOT
         -> context resolver builds normalized evaluator input
         -> evaluator runs
         -> result upserted, ticket transitioned, job progress recomputed
 
-The payload is read from `evaluation_payloads`, never from a file. LLM calls
-happen outside any database transaction so a slow judge cannot hold locks.
+    The payload is re-read from the temporary dataset folder using the ticket's
+    source_dataset_id + source_payload_ref. The metric configuration is taken
+    from the ticket's immutable metric_snapshot_json, never from the currently
+    active metric_records row. LLM calls happen outside any database transaction.
 """
 
 from __future__ import annotations
@@ -36,17 +39,18 @@ from app.models.enums import (
     TicketStatus,
 )
 from app.repositories.job_repository import JobRepository
-from app.repositories.payload_repository import PayloadRepository
 from app.repositories.result_repository import ResultRepository
 from app.repositories.ticket_repository import TicketRepository
-from app.services.config_validation import find_check
 from app.services.context_resolver import ResolvedInput, resolve_input_mapping
+from app.services.dataset_folder import load_source_payload
 from app.services.errors import (
     MissingContextError,
     PermanentEvaluationError,
+    SourcePayloadMissingError,
     classify_error,
     error_code_for,
 )
+from app.services.profile_resolution import check_from_snapshot
 from app.services.ticket_service import settle_ticket
 
 logger = get_logger(__name__)
@@ -67,7 +71,9 @@ class JobCancelled(RuntimeError):
     pass
 
 
-def _applies(check: dict[str, Any], resolved: ResolvedInput, payload: dict[str, Any]) -> tuple[bool, str]:
+def _applies(
+    check: dict[str, Any], resolved: ResolvedInput, payload: dict[str, Any]
+) -> tuple[bool, str]:
     """Evaluate an optional `applies_when` guard for the check."""
     condition = check.get("applies_when")
     if not condition:
@@ -178,6 +184,10 @@ def _persist_once(
                     job_id=ticket.job_id,
                     ticket_id=ticket.id,
                     payload_id=ticket.payload_id,
+                    source_payload_ref=ticket.source_payload_ref,
+                    metric_record_id=ticket.metric_record_id,
+                    metric_id=ticket.metric_id,
+                    metric_version_number=ticket.metric_version_number,
                     check_id=ticket.check_id,
                     check_type=ticket.check_type,
                     evaluator_type=output.evaluator_type or ticket.evaluator,
@@ -233,20 +243,27 @@ def execute_ticket(ticket: EvaluationTicket, *, worker_id: str | None = None) ->
                 )
             if job.cancellation_requested_at is not None or job.status is JobStatus.CANCELLED:
                 raise JobCancelled()
-            payload_json = PayloadRepository(conn).get_payload_json(ticket.payload_id)
-            if payload_json is None:
-                raise PermanentEvaluationError(
-                    f"payload {ticket.payload_id} not found in PostgreSQL",
-                    error_code="PAYLOAD_MISSING",
-                )
-            snapshot = job.config_snapshot_json or {}
+            stored = TicketRepository(conn).get(ticket.id)
+            snapshot = (
+                stored.metric_snapshot_json
+                if stored and stored.metric_snapshot_json
+                else (ticket.metric_snapshot_json or {})
+            )
 
-        check = find_check(snapshot, ticket.check_id)
+        check = check_from_snapshot(snapshot)
         if check is None:
             raise PermanentEvaluationError(
-                f"check '{ticket.check_id}' is not present in the job configuration snapshot",
+                f"metric snapshot on ticket {ticket.id} is missing a check definition",
                 error_code="CHECK_NOT_IN_SNAPSHOT",
             )
+
+        try:
+            payload_json = load_source_payload(
+                dataset_id=ticket.source_dataset_id or (job.dataset_id or ""),
+                payload_ref=ticket.source_payload_ref,
+            )
+        except SourcePayloadMissingError:
+            raise
 
         policy = OnMissingContext(
             check.get("on_missing_context") or settings.default_on_missing_context
@@ -441,9 +458,7 @@ def _handle_failure(
             retry_in_seconds=delay,
         )
 
-    final_code = (
-        "TRANSIENT_ATTEMPTS_EXHAUSTED" if error_class is ErrorClass.TRANSIENT else code
-    )
+    final_code = "TRANSIENT_ATTEMPTS_EXHAUSTED" if error_class is ErrorClass.TRANSIENT else code
     output = EvaluatorOutput(
         status=ResultStatus.ERROR,
         passed=None,

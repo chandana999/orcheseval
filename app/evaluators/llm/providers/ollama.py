@@ -1,4 +1,4 @@
-"""Local Ollama provider. Ported from evalforge-local."""
+"""Local Ollama provider. Ported from eval-orchestrator."""
 
 import time
 from typing import Any

@@ -36,7 +36,7 @@ Respond with ONLY a JSON object in this exact shape:
 
 
 def estimate_cost_usd(prompt_tokens: int, completion_tokens: int) -> float:
-    """Cost estimation ported from evalforge-local."""
+    """Cost estimation ported from eval-orchestrator."""
     prompt_tokens = max(0, int(prompt_tokens or 0))
     completion_tokens = max(0, int(completion_tokens or 0))
     cost = (prompt_tokens / 1_000_000) * settings.input_cost_per_1m + (

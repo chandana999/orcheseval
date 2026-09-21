@@ -7,66 +7,66 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from app.models.enums import (
-    CheckType,
-    ConfigStatus,
-    DatasetStatus,
-    JobStatus,
-    ResultStatus,
-    TicketStatus,
-)
+from app.models.enums import CheckType, JobStatus, ResultStatus, TicketStatus
 
 
 @dataclass
-class Dataset:
-    id: uuid.UUID
+class MetricRecord:
+    metric_record_id: uuid.UUID
+    metric_id: str
+    metric_code: str
+    metric_name: str
+    metric_desc: str | None
+    metric_type: str
+    metric_version_number: int
+    definition_payload: dict[str, Any]
+    default_threshold_operator: str | None
+    llm_model_name: str | None
+    llm_model_version: str | None
+    llm_deployed_id: str | None
+    is_active_indicator: bool
+    previous_metric_record_id: uuid.UUID | None
+    change_summary: str | None
+    metric_create_timestamp: datetime | None = None
+
+
+@dataclass
+class EvaluationProfile:
+    """A named, versioned collection of metric versions.
+
+    `evaluation_profile_id` is the business key carried in
+    payload.agent_registry; `id` is the surrogate key rows are mapped to.
+    """
+
+    evaluation_profile_id: str
     name: str
-    description: str | None
-    source_type: str
-    source_path: str | None
-    record_count: int
-    status: DatasetStatus
-    checksum_sha256: str | None
-    validation_report: dict[str, Any] | None
-    metadata_json: dict[str, Any] | None
-    created_at: datetime
-    updated_at: datetime | None = None
-
-
-@dataclass
-class EvaluationPayload:
-    id: uuid.UUID
-    dataset_id: uuid.UUID | None
-    external_payload_id: str | None
-    trace_id: str | None
-    session_id: str | None
-    workflow_id: str | None
-    payload_json: dict[str, Any]
-    payload_version: str | None
-    source_type: str
-    validation_report: dict[str, Any] | None
-    created_at: datetime | None = None
-
-
-@dataclass
-class EvaluationConfig:
-    id: uuid.UUID
-    name: str
-    version: int
-    description: str | None
-    config_json: dict[str, Any]
-    status: ConfigStatus
-    checks_count: int
+    version: int = 1
+    description: str | None = None
+    is_active: bool = True
+    metadata_json: dict[str, Any] | None = None
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+@dataclass
+class EvaluationProfileMetric:
+    """Maps a profile to one exact metric record version."""
+
+    profile_id: uuid.UUID
+    metric_record_id: uuid.UUID
+    metric_id: str | None = None
+    execution_order: int = 0
+    enabled: bool = True
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
+    created_at: datetime | None = None
 
 
 @dataclass
 class EvaluationJob:
     id: uuid.UUID
     name: str | None
-    dataset_id: uuid.UUID | None
-    evaluation_config_id: uuid.UUID
+    dataset_id: str | None
     config_snapshot_json: dict[str, Any]
     status: JobStatus
     payload_count: int
@@ -75,7 +75,7 @@ class EvaluationJob:
     failed_tickets: int
     cancelled_tickets: int
     not_applicable_tickets: int
-    created_at: datetime
+    created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     cancellation_requested_at: datetime | None = None
@@ -88,7 +88,14 @@ class EvaluationTicket:
     id: uuid.UUID
     job_id: uuid.UUID
     payload_id: uuid.UUID
-    evaluation_config_id: uuid.UUID
+    source_dataset_id: str
+    source_payload_ref: str
+    source_payload_id: str | None
+    metric_record_id: uuid.UUID
+    metric_id: str
+    metric_version_number: int
+    evaluation_profile_id: str
+    metric_snapshot_json: dict[str, Any]
     check_id: str
     check_type: CheckType
     evaluator: str
@@ -116,6 +123,10 @@ class EvaluationResult:
     job_id: uuid.UUID
     ticket_id: uuid.UUID
     payload_id: uuid.UUID
+    source_payload_ref: str | None
+    metric_record_id: uuid.UUID | None
+    metric_id: str | None
+    metric_version_number: int | None
     check_id: str
     check_type: CheckType
     evaluator_type: str

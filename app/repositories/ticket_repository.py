@@ -8,7 +8,9 @@ from app.models.enums import CheckType, TicketStatus, assert_ticket_transition
 from app.repositories.base import BaseRepository
 
 TICKET_COLUMNS = """
-    id, job_id, payload_id, evaluation_config_id, check_id, check_type, evaluator,
+    id, job_id, payload_id, source_dataset_id, source_payload_ref, source_payload_id,
+    metric_record_id, metric_id, metric_version_number, evaluation_profile_id,
+    metric_snapshot_json, check_id, check_type, evaluator,
     status, priority, attempt_count, max_attempts, available_at, worker_id,
     claimed_at, started_at, completed_at, lease_expires_at, result_id,
     input_snapshot_json, error_code, error_message, created_at, updated_at
@@ -28,7 +30,14 @@ class TicketRepository(BaseRepository):
             id=row["id"],
             job_id=row["job_id"],
             payload_id=row["payload_id"],
-            evaluation_config_id=row["evaluation_config_id"],
+            source_dataset_id=row["source_dataset_id"],
+            source_payload_ref=row["source_payload_ref"],
+            source_payload_id=row["source_payload_id"],
+            metric_record_id=row["metric_record_id"],
+            metric_id=row["metric_id"],
+            metric_version_number=row["metric_version_number"],
+            evaluation_profile_id=row["evaluation_profile_id"],
+            metric_snapshot_json=row["metric_snapshot_json"] or {},
             check_id=row["check_id"],
             check_type=self._enum(CheckType, row["check_type"]),
             evaluator=row["evaluator"],
@@ -58,18 +67,29 @@ class TicketRepository(BaseRepository):
             cur.executemany(
                 """
                 INSERT INTO evaluation_tickets (
-                    id, job_id, payload_id, evaluation_config_id, check_id,
-                    check_type, evaluator, status, priority, attempt_count,
+                    id, job_id, payload_id, source_dataset_id, source_payload_ref,
+                    source_payload_id, metric_record_id, metric_id,
+                    metric_version_number, evaluation_profile_id, metric_snapshot_json,
+                    check_id, check_type, evaluator, status, priority, attempt_count,
                     max_attempts, available_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()
+                )
                 """,
                 [
                     (
                         t.id,
                         t.job_id,
                         t.payload_id,
-                        t.evaluation_config_id,
+                        t.source_dataset_id,
+                        t.source_payload_ref,
+                        t.source_payload_id,
+                        t.metric_record_id,
+                        t.metric_id,
+                        t.metric_version_number,
+                        t.evaluation_profile_id,
+                        self._json(t.metric_snapshot_json),
                         t.check_id,
                         t.check_type.value,
                         t.evaluator,
@@ -380,6 +400,7 @@ class TicketRepository(BaseRepository):
         *,
         status: TicketStatus | None = None,
         check_id: str | None = None,
+        metric_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[EvaluationTicket]]:
@@ -391,6 +412,9 @@ class TicketRepository(BaseRepository):
         if check_id is not None:
             clauses.append("check_id = %s")
             params.append(check_id)
+        if metric_id is not None:
+            clauses.append("metric_id = %s")
+            params.append(metric_id)
         where = " AND ".join(clauses)
         total = self.conn.execute(
             f"SELECT COUNT(*) AS n FROM evaluation_tickets WHERE {where}",  # noqa: S608

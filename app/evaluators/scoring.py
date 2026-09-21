@@ -1,4 +1,4 @@
-"""Text comparison primitives reused from evalforge-local.
+"""Text comparison primitives reused from eval-orchestrator.
 
 `normalize`, `score_exact`, `score_fuzzy`, `score_semantic`, and the hash/OpenAI
 embedding backend are ported from the source project so comparison behaviour

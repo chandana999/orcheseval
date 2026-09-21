@@ -1,0 +1,73 @@
+﻿{
+  "payload_metadata": {
+    "payload_id": "pl-2026-01-05-0002",
+    "version": "2026-01",
+    "producer": "support-triage-agent"
+  },
+  "agent_registry": {
+    "agent_id": "support-triage-agent",
+    "agent_name": "Support Triage Agent",
+    "agent_version": "1.0",
+    "evaluation_profile_id": "agent-response-quality-v1"
+  },
+  "trace_data": {
+    "trace_id": "tr-9f2c42",
+    "session_id": "se-4472",
+    "workflow_id": "support_triage",
+    "started_at": "2026-01-05T10:00:00Z",
+    "duration_ms": 5210
+  },
+  "session_context": {
+    "session_id": "se-4472",
+    "customer_id": "cus-8812",
+    "conversation_history": [
+      { "role": "user", "content": "I was charged twice for my subscription this month." },
+      { "role": "assistant", "content": "I see a duplicate charge. I can refund it now." },
+      { "role": "user", "content": "Yes please." }
+    ],
+    "final_response": "Your duplicate charge of $19.00 has been refunded to the original card."
+  },
+  "spans": [
+    {
+      "span_id": "sp-1",
+      "agent_id": "classifier",
+      "agent_type": "classifier",
+      "order": 1,
+      "start_time": "2026-01-05T10:00:00Z",
+      "output": { "category": "billing", "confidence": 0.94 },
+      "tool_calls": []
+    },
+    {
+      "span_id": "sp-2",
+      "agent_id": "validator",
+      "agent_type": "validator",
+      "order": 2,
+      "start_time": "2026-01-05T10:00:02Z",
+      "output": { "is_valid": true, "reason": "duplicate charge confirmed" },
+      "tool_calls": [
+        {
+          "name": "policy_lookup",
+          "arguments": { "category": "billing" },
+          "response": { "policy": "refund_within_30_days", "allowed": true }
+        }
+      ]
+    },
+    {
+      "span_id": "sp-3",
+      "agent_id": "summarizer",
+      "agent_type": "summarizer",
+      "order": 3,
+      "start_time": "2026-01-05T10:00:05Z",
+      "output": {
+        "summary": "Customer reported a duplicate subscription charge; the agent confirmed it and issued a refund.",
+        "category": "billing"
+      },
+      "tool_calls": []
+    }
+  ],
+  "resolved_configuration": {
+    "model": "gpt-4o-mini",
+    "temperature": 0
+  }
+}
+

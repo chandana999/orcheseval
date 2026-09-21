@@ -40,6 +40,12 @@ class MissingContextError(EvaluationError):
     error_code = "MISSING_CONTEXT"
 
 
+class SourcePayloadMissingError(PermanentEvaluationError):
+    """The source JSON file under EVALUATION_TEMP_ROOT is gone or unreadable."""
+
+    error_code = "SOURCE_PAYLOAD_MISSING"
+
+
 class UnknownEvaluatorError(PermanentEvaluationError):
     error_code = "UNKNOWN_EVALUATOR"
 

@@ -15,6 +15,10 @@ class ResultRepository(BaseRepository):
             job_id=row["job_id"],
             ticket_id=row["ticket_id"],
             payload_id=row["payload_id"],
+            source_payload_ref=row.get("source_payload_ref"),
+            metric_record_id=row.get("metric_record_id"),
+            metric_id=row.get("metric_id"),
+            metric_version_number=row.get("metric_version_number"),
             check_id=row["check_id"],
             check_type=self._enum(CheckType, row["check_type"]),
             evaluator_type=row["evaluator_type"],
@@ -35,24 +39,30 @@ class ResultRepository(BaseRepository):
         )
 
     def upsert(self, result: EvaluationResult) -> EvaluationResult:
-        """Idempotent persistence keyed by (job_id, payload_id, check_id).
+        """Idempotent persistence keyed by ticket_id.
 
         A retried ticket overwrites its previous result instead of creating a
-        duplicate row, so at most one result exists per payload/check per job.
+        duplicate row, so at most one result exists per ticket.
         """
         row = self.conn.execute(
             """
             INSERT INTO evaluation_results (
-                id, job_id, ticket_id, payload_id, check_id, check_type,
-                evaluator_type, evaluator_version, status, passed, score,
-                explanation, evidence_json, input_snapshot_json, output_json,
-                error_code, error_message, execution_time_ms, attempt_count,
-                completed_at
+                id, job_id, ticket_id, payload_id, source_payload_ref,
+                metric_record_id, metric_id, metric_version_number,
+                check_id, check_type, evaluator_type, evaluator_version, status,
+                passed, score, explanation, evidence_json, input_snapshot_json,
+                output_json, error_code, error_message, execution_time_ms,
+                attempt_count, completed_at
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, now())
-            ON CONFLICT (job_id, payload_id, check_id) DO UPDATE SET
-                ticket_id = EXCLUDED.ticket_id,
+                    %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (ticket_id) DO UPDATE SET
+                payload_id = EXCLUDED.payload_id,
+                source_payload_ref = EXCLUDED.source_payload_ref,
+                metric_record_id = EXCLUDED.metric_record_id,
+                metric_id = EXCLUDED.metric_id,
+                metric_version_number = EXCLUDED.metric_version_number,
+                check_id = EXCLUDED.check_id,
                 check_type = EXCLUDED.check_type,
                 evaluator_type = EXCLUDED.evaluator_type,
                 evaluator_version = EXCLUDED.evaluator_version,
@@ -75,6 +85,10 @@ class ResultRepository(BaseRepository):
                 result.job_id,
                 result.ticket_id,
                 result.payload_id,
+                result.source_payload_ref,
+                result.metric_record_id,
+                result.metric_id,
+                result.metric_version_number,
                 result.check_id,
                 result.check_type.value,
                 result.evaluator_type,
@@ -113,6 +127,8 @@ class ResultRepository(BaseRepository):
         status: ResultStatus | None = None,
         check_id: str | None = None,
         payload_id: uuid.UUID | None = None,
+        source_payload_ref: str | None = None,
+        metric_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[EvaluationResult]]:
@@ -127,6 +143,12 @@ class ResultRepository(BaseRepository):
         if payload_id is not None:
             clauses.append("payload_id = %s")
             params.append(payload_id)
+        if source_payload_ref is not None:
+            clauses.append("source_payload_ref = %s")
+            params.append(source_payload_ref)
+        if metric_id is not None:
+            clauses.append("metric_id = %s")
+            params.append(metric_id)
         where = " AND ".join(clauses)
         total = self.conn.execute(
             f"SELECT COUNT(*) AS n FROM evaluation_results WHERE {where}",  # noqa: S608

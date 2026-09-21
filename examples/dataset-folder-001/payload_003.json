@@ -1,18 +1,24 @@
-{
+﻿{
   "payload_metadata": {
-    "payload_id": "pl-2026-01-05-0001",
+    "payload_id": "pl-2026-01-05-0003",
     "version": "2026-01",
     "producer": "support-triage-agent"
   },
+  "agent_registry": {
+    "agent_id": "support-triage-agent",
+    "agent_name": "Support Triage Agent",
+    "agent_version": "1.0",
+    "evaluation_profile_id": "agent-response-quality-v1"
+  },
   "trace_data": {
-    "trace_id": "tr-9f2c41",
-    "session_id": "se-4471",
+    "trace_id": "tr-9f2c43",
+    "session_id": "se-4473",
     "workflow_id": "support_triage",
     "started_at": "2026-01-05T10:00:00Z",
     "duration_ms": 5210
   },
   "session_context": {
-    "session_id": "se-4471",
+    "session_id": "se-4473",
     "customer_id": "cus-8812",
     "conversation_history": [
       { "role": "user", "content": "I was charged twice for my subscription this month." },
@@ -64,3 +70,4 @@
     "temperature": 0
   }
 }
+
