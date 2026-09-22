@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
+from sqlalchemy import text
+
 from app.core.config import settings
-from app.db.migration_runner import status, upgrade
+from app.db.migrate import current, upgrade
 
 EXPECTED_TABLES = {
-    "metric_records",
-    "evaluation_profiles",
-    "evaluation_profile_metrics",
     "evaluation_jobs",
     "evaluation_tickets",
     "evaluation_results",
-    "schema_migrations",
+    "alembic_version",
 }
 
 DROPPED_TABLES = {
     "datasets",
     "evaluation_configs",
     "evaluation_payloads",
+    "metric_records",
+    "evaluation_profiles",
+    "evaluation_profile_metrics",
 }
 
 
@@ -29,12 +31,14 @@ def test_uses_the_dedicated_database_not_evalforge_local():
 
 def test_all_expected_tables_exist(conn):
     rows = conn.execute(
-        """
-        SELECT table_name FROM information_schema.tables
-        WHERE table_schema = %s
-        """,
-        (settings.pgschema,),
-    ).fetchall()
+        text(
+            """
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = :schema
+            """
+        ),
+        {"schema": settings.pgschema},
+    ).mappings()
     names = {r["table_name"] for r in rows}
     assert EXPECTED_TABLES.issubset(names), EXPECTED_TABLES - names
     # The pre-profile tables are gone; nothing reads or writes them.
@@ -42,9 +46,7 @@ def test_all_expected_tables_exist(conn):
 
 
 def test_migration_ledger_is_complete_and_rerun_is_a_noop():
-    rows = status()
-    assert rows, "no migration files found"
-    assert all(r["state"] == "applied" for r in rows), rows
+    assert current() == "0002_job_idempotency"
     assert upgrade() == []
 
 
@@ -53,13 +55,15 @@ def test_enum_labels_match_the_domain_model(conn):
 
     def labels(enum_name: str) -> set[str]:
         rows = conn.execute(
-            """
-            SELECT e.enumlabel AS label
-            FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
-            WHERE t.typname = %s
-            """,
-            (enum_name,),
-        ).fetchall()
+            text(
+                """
+                SELECT e.enumlabel AS label
+                FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+                WHERE t.typname = :name
+                """
+            ),
+            {"name": enum_name},
+        ).mappings()
         return {r["label"] for r in rows}
 
     assert labels("evaluation_ticket_status") == {s.value for s in TicketStatus}
@@ -72,92 +76,56 @@ def test_enum_labels_match_the_domain_model(conn):
 
 def test_claim_and_idempotency_indexes_exist(conn):
     rows = conn.execute(
-        "SELECT indexname FROM pg_indexes WHERE schemaname = %s",
-        (settings.pgschema,),
-    ).fetchall()
+        text("SELECT indexname FROM pg_indexes WHERE schemaname = :schema"),
+        {"schema": settings.pgschema},
+    ).mappings()
     names = {r["indexname"] for r in rows}
     assert "ix_tickets_claim" in names
     assert "ix_tickets_lease" in names
     assert "uq_tickets_job_payload_metric" in names
-    assert "uq_metric_records_id_version" in names
-    assert "uq_profile_metric_id" in names
     assert "uq_results_ticket_id" in names
+    assert "uq_evaluation_jobs_idempotency_key" in names
 
 
 def test_jobs_no_longer_reference_evaluation_configs(conn):
     rows = conn.execute(
-        """
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = 'evaluation_jobs'
-        """,
-        (settings.pgschema,),
-    ).fetchall()
+        text(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = 'evaluation_jobs'
+            """
+        ),
+        {"schema": settings.pgschema},
+    ).mappings()
     columns = {r["column_name"] for r in rows}
     assert "dataset_id" in columns
     assert "evaluation_config_id" not in columns
     assert "config_snapshot_json" in columns
 
     dataset_type = conn.execute(
-        """
-        SELECT data_type FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = 'evaluation_jobs' AND column_name = 'dataset_id'
-        """,
-        (settings.pgschema,),
-    ).fetchone()["data_type"]
+        text(
+            """
+            SELECT data_type FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = 'evaluation_jobs'
+              AND column_name = 'dataset_id'
+            """
+        ),
+        {"schema": settings.pgschema},
+    ).mappings().one()["data_type"]
     assert dataset_type in {"text", "character varying"}
 
 
-def test_duplicate_profile_metric_mapping_is_rejected(conn):
-    import uuid
-
-    from psycopg.errors import UniqueViolation
-    from psycopg.types.json import Jsonb
-
-    metric_record_id = uuid.uuid4()
-    other_record_id = uuid.uuid4()
-    profile_id = uuid.uuid4()
-    try:
-        with conn.transaction():
-            conn.execute(
-                """
-                INSERT INTO metric_records (
-                    metric_record_id, metric_id, metric_code, metric_name,
-                    metric_type, metric_version_number, definition_payload
-                )
-                VALUES
-                    (%s, 'm1', 'm1-v1', 'm1', 'DETERMINISTIC', 1, %s),
-                    (%s, 'm1', 'm1-v2', 'm1', 'DETERMINISTIC', 2, %s)
-                """,
-                (
-                    metric_record_id,
-                    Jsonb({"check_id": "m1", "evaluator": "required_fields"}),
-                    other_record_id,
-                    Jsonb({"check_id": "m1", "evaluator": "required_fields"}),
-                ),
-            )
-            conn.execute(
-                "INSERT INTO evaluation_profiles (id, evaluation_profile_id, name) VALUES (%s, 'p1', 'p1')",
-                (profile_id,),
-            )
-            # Two versions of the same logical metric in one profile must fail.
-            conn.execute(
-                """
-                INSERT INTO evaluation_profile_metrics (
-                    id, profile_id, metric_record_id, metric_id
-                )
-                VALUES (%s, %s, %s, 'm1')
-                """,
-                (uuid.uuid4(), profile_id, metric_record_id),
-            )
-            conn.execute(
-                """
-                INSERT INTO evaluation_profile_metrics (
-                    id, profile_id, metric_record_id, metric_id
-                )
-                VALUES (%s, %s, %s, 'm1')
-                """,
-                (uuid.uuid4(), profile_id, other_record_id),
-            )
-    except UniqueViolation:
-        return
-    raise AssertionError("duplicate profile metric mapping should be rejected")
+def test_profile_catalog_tables_are_gone(conn):
+    rows = conn.execute(
+        text(
+            """
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = :schema
+            """
+        ),
+        {"schema": settings.pgschema},
+    ).mappings()
+    names = {r["table_name"] for r in rows}
+    assert "evaluation_profiles" not in names
+    assert "evaluation_profile_metrics" not in names
+    assert "metric_records" not in names

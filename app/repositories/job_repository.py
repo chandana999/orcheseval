@@ -5,7 +5,7 @@ from typing import Any
 
 from app.models.entities import EvaluationJob, JobProgress
 from app.models.enums import JobStatus, TicketStatus
-from app.repositories.base import BaseRepository
+from app.repositories.base import BaseRepository, _json
 
 
 class JobRepository(BaseRepository):
@@ -30,48 +30,68 @@ class JobRepository(BaseRepository):
             error_message=row.get("error_message"),
         )
 
-    def insert(self, job: EvaluationJob) -> EvaluationJob:
-        row = self.conn.execute(
+    def insert(
+        self,
+        job: EvaluationJob,
+        *,
+        idempotency_key: str | None = None,
+        idempotency_request_hash: str | None = None,
+    ) -> EvaluationJob:
+        row = self._one(
             """
             INSERT INTO evaluation_jobs (
                 id, name, dataset_id, config_snapshot_json,
-                status, payload_count, total_tickets
+                status, payload_count, total_tickets,
+                idempotency_key, idempotency_request_hash
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (
+                :id, :name, :dataset_id, CAST(:config_snapshot_json AS jsonb),
+                :status, :payload_count, :total_tickets,
+                :idempotency_key, :idempotency_request_hash
+            )
             RETURNING *
             """,
-            (
-                job.id,
-                job.name,
-                job.dataset_id,
-                self._json(job.config_snapshot_json),
-                job.status.value,
-                job.payload_count,
-                job.total_tickets,
-            ),
-        ).fetchone()
+            {
+                "id": job.id,
+                "name": job.name,
+                "dataset_id": job.dataset_id,
+                "config_snapshot_json": _json(job.config_snapshot_json),
+                "status": job.status.value,
+                "payload_count": job.payload_count,
+                "total_tickets": job.total_tickets,
+                "idempotency_key": idempotency_key,
+                "idempotency_request_hash": idempotency_request_hash,
+            },
+        )
         return self._to_entity(row)
 
+    def get_by_idempotency_key(self, key: str) -> tuple[EvaluationJob, str | None] | None:
+        row = self._one(
+            "SELECT * FROM evaluation_jobs WHERE idempotency_key = :key",
+            {"key": key},
+        )
+        if row is None:
+            return None
+        return self._to_entity(row), row.get("idempotency_request_hash")
+
     def get(self, job_id: uuid.UUID) -> EvaluationJob | None:
-        row = self.conn.execute("SELECT * FROM evaluation_jobs WHERE id = %s", (job_id,)).fetchone()
+        row = self._one("SELECT * FROM evaluation_jobs WHERE id = :id", {"id": job_id})
         return self._to_entity(row) if row else None
 
     def get_for_update(self, job_id: uuid.UUID) -> EvaluationJob | None:
-        """Lock the job row so concurrent runners serialize progress updates."""
-        row = self.conn.execute(
-            "SELECT * FROM evaluation_jobs WHERE id = %s FOR UPDATE", (job_id,)
-        ).fetchone()
+        row = self._one(
+            "SELECT * FROM evaluation_jobs WHERE id = :id FOR UPDATE", {"id": job_id}
+        )
         return self._to_entity(row) if row else None
 
     def get_cancellation_state(self, job_id: uuid.UUID) -> tuple[JobStatus, bool] | None:
-        """Cheap check used by the runner before persisting a result."""
-        row = self.conn.execute(
+        row = self._one(
             """
             SELECT status, cancellation_requested_at
-            FROM evaluation_jobs WHERE id = %s
+            FROM evaluation_jobs WHERE id = :id
             """,
-            (job_id,),
-        ).fetchone()
+            {"id": job_id},
+        )
         if row is None:
             return None
         return self._enum(JobStatus, row["status"]), row["cancellation_requested_at"] is not None
@@ -85,114 +105,100 @@ class JobRepository(BaseRepository):
         offset: int = 0,
     ) -> tuple[int, list[EvaluationJob]]:
         clauses: list[str] = []
-        params: list[Any] = []
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
         if status is not None:
-            clauses.append("status = %s")
-            params.append(status.value)
+            clauses.append("status = :status")
+            params["status"] = status.value
         if dataset_id is not None:
-            clauses.append("dataset_id = %s")
-            params.append(dataset_id)
+            clauses.append("dataset_id = :dataset_id")
+            params["dataset_id"] = dataset_id
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        total = self.conn.execute(
-            f"SELECT COUNT(*) AS n FROM evaluation_jobs {where}",  # noqa: S608
-            params,
-        ).fetchone()["n"]
-        rows = self.conn.execute(
+        filters = {key: value for key, value in params.items() if key not in {"limit", "offset"}}
+        total = self._one(f"SELECT COUNT(*) AS n FROM evaluation_jobs {where}", filters)["n"]
+        rows = self._all(
             f"""
             SELECT * FROM evaluation_jobs {where}
-            ORDER BY created_at DESC OFFSET %s LIMIT %s
-            """,  # noqa: S608
-            [*params, offset, limit],
-        ).fetchall()
-        return int(total), [self._to_entity(r) for r in rows]
+            ORDER BY created_at DESC OFFSET :offset LIMIT :limit
+            """,
+            params,
+        )
+        return int(total), [self._to_entity(row) for row in rows]
 
     def set_total_tickets(self, job_id: uuid.UUID, *, total: int, status: JobStatus) -> None:
-        self.conn.execute(
+        self._run(
             """
             UPDATE evaluation_jobs
-            SET total_tickets = %s, status = %s, updated_at = now()
-            WHERE id = %s
+            SET total_tickets = :total, status = :status, updated_at = now()
+            WHERE id = :id
             """,
-            (total, status.value, job_id),
+            {"total": total, "status": status.value, "id": job_id},
         )
 
     def mark_running_if_pending(self, job_ids: list[uuid.UUID]) -> int:
-        """Flip jobs to RUNNING when their first ticket is claimed.
-
-        Uses SKIP LOCKED so a runner claiming tickets never waits on another
-        runner that is flipping the same job.
-        """
         if not job_ids:
             return 0
-        locked = self.conn.execute(
+        locked = self._all_in(
             """
             SELECT id FROM evaluation_jobs
-            WHERE id = ANY(%s) AND status IN ('CREATED', 'READY')
+            WHERE id IN :ids AND status IN ('CREATED', 'READY')
             FOR UPDATE SKIP LOCKED
             """,
-            (job_ids,),
-        ).fetchall()
+            key="ids",
+            values=job_ids,
+        )
         if not locked:
             return 0
         ids = [row["id"] for row in locked]
-        self.conn.execute(
+        self._run_in(
             """
             UPDATE evaluation_jobs
             SET status = 'RUNNING',
                 started_at = COALESCE(started_at, now()),
                 updated_at = now()
-            WHERE id = ANY(%s)
+            WHERE id IN :ids
             """,
-            (ids,),
+            key="ids",
+            values=ids,
         )
         return len(ids)
 
     def request_cancellation(self, job_id: uuid.UUID) -> bool:
-        """Flag the job so no further tickets can be claimed. Idempotent."""
-        row = self.conn.execute(
+        row = self._one(
             """
             UPDATE evaluation_jobs
             SET cancellation_requested_at = COALESCE(cancellation_requested_at, now()),
                 updated_at = now()
-            WHERE id = %s
+            WHERE id = :id
             RETURNING cancellation_requested_at
             """,
-            (job_id,),
-        ).fetchone()
+            {"id": job_id},
+        )
         return row is not None
 
     def fail(self, job_id: uuid.UUID, message: str) -> None:
-        self.conn.execute(
+        self._run(
             """
             UPDATE evaluation_jobs
             SET status = 'FAILED',
-                error_message = %s,
+                error_message = :message,
                 completed_at = COALESCE(completed_at, now()),
                 updated_at = now()
-            WHERE id = %s
+            WHERE id = :id
             """,
-            (message[:4000], job_id),
+            {"message": message[:4000], "id": job_id},
         )
 
     def ticket_counts(self, job_id: uuid.UUID) -> dict[str, int]:
-        rows = self.conn.execute(
+        rows = self._all(
             """
             SELECT status, COUNT(*) AS n
-            FROM evaluation_tickets WHERE job_id = %s GROUP BY status
+            FROM evaluation_tickets WHERE job_id = :id GROUP BY status
             """,
-            (job_id,),
-        ).fetchall()
+            {"id": job_id},
+        )
         return {row["status"]: int(row["n"]) for row in rows}
 
     def recompute_progress(self, job_id: uuid.UUID, *, lock: bool = True) -> JobProgress | None:
-        """Derive job counters and status from durable ticket rows.
-
-        This is the only place job progress is written: counters are never
-        incremented from runner memory, so a crashed runner cannot corrupt them.
-
-        Callers that already hold FOR UPDATE on the job row must pass lock=False
-        so lock order stays job-then-ticket (avoids FK deadlocks).
-        """
         job = self.get_for_update(job_id) if lock else self.get(job_id)
         if job is None:
             return None
@@ -225,36 +231,34 @@ class JobRepository(BaseRepository):
             status = JobStatus.FAILED
 
         is_terminal = total > 0 and terminal >= total
-        started = status != JobStatus.READY and status != JobStatus.CREATED
-
-        row = self.conn.execute(
+        started = status not in {JobStatus.READY, JobStatus.CREATED}
+        row = self._one(
             """
             UPDATE evaluation_jobs
-            SET status = %s,
-                total_tickets = GREATEST(total_tickets, %s),
-                completed_tickets = %s,
-                failed_tickets = %s,
-                cancelled_tickets = %s,
-                not_applicable_tickets = %s,
-                started_at = CASE WHEN %s THEN COALESCE(started_at, now()) ELSE started_at END,
-                completed_at = CASE WHEN %s THEN COALESCE(completed_at, now()) ELSE NULL END,
+            SET status = :status,
+                total_tickets = GREATEST(total_tickets, :total),
+                completed_tickets = :done,
+                failed_tickets = :failed,
+                cancelled_tickets = :cancelled,
+                not_applicable_tickets = :not_applicable,
+                started_at = CASE WHEN :started THEN COALESCE(started_at, now()) ELSE started_at END,
+                completed_at = CASE WHEN :is_terminal THEN COALESCE(completed_at, now()) ELSE NULL END,
                 updated_at = now()
-            WHERE id = %s
+            WHERE id = :id
             RETURNING *
             """,
-            (
-                status.value,
-                total,
-                done,
-                failed,
-                cancelled,
-                not_applicable,
-                started,
-                is_terminal,
-                job_id,
-            ),
-        ).fetchone()
-
+            {
+                "status": status.value,
+                "total": total,
+                "done": done,
+                "failed": failed,
+                "cancelled": cancelled,
+                "not_applicable": not_applicable,
+                "started": started,
+                "is_terminal": is_terminal,
+                "id": job_id,
+            },
+        )
         return JobProgress(
             job_id=job_id,
             status=self._enum(JobStatus, row["status"]),

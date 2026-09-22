@@ -20,6 +20,7 @@ from app.services.payload_validation import PayloadValidationError, extract_iden
 logger = get_logger(__name__)
 
 SUPPORTED_PAYLOAD_SUFFIXES = {".json"}
+CONFIG_FILENAME = "config.json"
 DATASET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
 
@@ -48,6 +49,7 @@ class DatasetFolderContents:
     dataset_id: str
     folder: Path
     payloads: list[PayloadFile]
+    config: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
 
 
@@ -131,7 +133,7 @@ def read_dataset_folder(dataset_id: str, *, root: Path | None = None) -> Dataset
         raise DatasetFolderError(f"could not list dataset folder {dataset_id!r}: {exc}") from exc
 
     for entry in entries:
-        if entry.name.startswith("."):
+        if entry.name.startswith(".") or entry.name.lower() == CONFIG_FILENAME:
             continue
         if entry.is_dir():
             warnings.append(f"skipped directory {entry.name!r}")
@@ -158,6 +160,13 @@ def read_dataset_folder(dataset_id: str, *, root: Path | None = None) -> Dataset
             f"dataset folder {dataset_id!r} contains no supported JSON payload files"
         )
 
+    config_path = folder / CONFIG_FILENAME
+    if not config_path.is_file():
+        raise DatasetFolderError(
+            f"dataset folder {dataset_id!r} is missing {CONFIG_FILENAME}"
+        )
+    config = _read_json_object(config_path)
+
     logger.info(
         "dataset_folder_read",
         dataset_id=dataset_id,
@@ -168,6 +177,7 @@ def read_dataset_folder(dataset_id: str, *, root: Path | None = None) -> Dataset
         dataset_id=dataset_id,
         folder=folder,
         payloads=payloads,
+        config=config,
         warnings=warnings,
     )
 

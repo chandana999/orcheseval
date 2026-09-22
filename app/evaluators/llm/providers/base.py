@@ -1,4 +1,7 @@
-"""LLM provider contract. Ported from eval-orchestrator (tenacity retry preserved)."""
+"""LLM provider contract.
+
+`generate` retries the provider call up to 3 times with exponential backoff.
+"""
 
 from typing import Any, Protocol
 

@@ -5,7 +5,7 @@ from typing import Any
 
 from app.models.entities import EvaluationResult
 from app.models.enums import CheckType, ResultStatus
-from app.repositories.base import BaseRepository
+from app.repositories.base import BaseRepository, _json
 
 
 class ResultRepository(BaseRepository):
@@ -39,12 +39,7 @@ class ResultRepository(BaseRepository):
         )
 
     def upsert(self, result: EvaluationResult) -> EvaluationResult:
-        """Idempotent persistence keyed by ticket_id.
-
-        A retried ticket overwrites its previous result instead of creating a
-        duplicate row, so at most one result exists per ticket.
-        """
-        row = self.conn.execute(
+        row = self._one(
             """
             INSERT INTO evaluation_results (
                 id, job_id, ticket_id, payload_id, source_payload_ref,
@@ -54,8 +49,15 @@ class ResultRepository(BaseRepository):
                 output_json, error_code, error_message, execution_time_ms,
                 attempt_count, completed_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, now())
+            VALUES (
+                :id, :job_id, :ticket_id, :payload_id, :source_payload_ref,
+                :metric_record_id, :metric_id, :metric_version_number,
+                :check_id, :check_type, :evaluator_type, :evaluator_version, :status,
+                :passed, :score, :explanation,
+                CAST(:evidence_json AS jsonb), CAST(:input_snapshot_json AS jsonb),
+                CAST(:output_json AS jsonb), :error_code, :error_message,
+                :execution_time_ms, :attempt_count, now()
+            )
             ON CONFLICT (ticket_id) DO UPDATE SET
                 payload_id = EXCLUDED.payload_id,
                 source_payload_ref = EXCLUDED.source_payload_ref,
@@ -80,44 +82,43 @@ class ResultRepository(BaseRepository):
                 completed_at = now()
             RETURNING *
             """,
-            (
-                result.id,
-                result.job_id,
-                result.ticket_id,
-                result.payload_id,
-                result.source_payload_ref,
-                result.metric_record_id,
-                result.metric_id,
-                result.metric_version_number,
-                result.check_id,
-                result.check_type.value,
-                result.evaluator_type,
-                result.evaluator_version,
-                result.status.value,
-                result.passed,
-                result.score,
-                result.explanation,
-                self._json(result.evidence_json),
-                self._json(result.input_snapshot_json),
-                self._json(result.output_json),
-                result.error_code,
-                result.error_message[:4000] if result.error_message else None,
-                result.execution_time_ms,
-                result.attempt_count,
-            ),
-        ).fetchone()
+            {
+                "id": result.id,
+                "job_id": result.job_id,
+                "ticket_id": result.ticket_id,
+                "payload_id": result.payload_id,
+                "source_payload_ref": result.source_payload_ref,
+                "metric_record_id": result.metric_record_id,
+                "metric_id": result.metric_id,
+                "metric_version_number": result.metric_version_number,
+                "check_id": result.check_id,
+                "check_type": result.check_type.value,
+                "evaluator_type": result.evaluator_type,
+                "evaluator_version": result.evaluator_version,
+                "status": result.status.value,
+                "passed": result.passed,
+                "score": result.score,
+                "explanation": result.explanation,
+                "evidence_json": _json(result.evidence_json),
+                "input_snapshot_json": _json(result.input_snapshot_json),
+                "output_json": _json(result.output_json),
+                "error_code": result.error_code,
+                "error_message": result.error_message[:4000] if result.error_message else None,
+                "execution_time_ms": result.execution_time_ms,
+                "attempt_count": result.attempt_count,
+            },
+        )
         return self._to_entity(row)
 
     def get(self, result_id: uuid.UUID) -> EvaluationResult | None:
-        row = self.conn.execute(
-            "SELECT * FROM evaluation_results WHERE id = %s", (result_id,)
-        ).fetchone()
+        row = self._one("SELECT * FROM evaluation_results WHERE id = :id", {"id": result_id})
         return self._to_entity(row) if row else None
 
     def get_by_ticket(self, ticket_id: uuid.UUID) -> EvaluationResult | None:
-        row = self.conn.execute(
-            "SELECT * FROM evaluation_results WHERE ticket_id = %s", (ticket_id,)
-        ).fetchone()
+        row = self._one(
+            "SELECT * FROM evaluation_results WHERE ticket_id = :ticket_id",
+            {"ticket_id": ticket_id},
+        )
         return self._to_entity(row) if row else None
 
     def list_by_job(
@@ -132,48 +133,47 @@ class ResultRepository(BaseRepository):
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[EvaluationResult]]:
-        clauses = ["job_id = %s"]
-        params: list[Any] = [job_id]
+        clauses = ["job_id = :job_id"]
+        params: dict[str, Any] = {"job_id": job_id, "limit": limit, "offset": offset}
         if status is not None:
-            clauses.append("status = %s")
-            params.append(status.value)
+            clauses.append("status = :status")
+            params["status"] = status.value
         if check_id is not None:
-            clauses.append("check_id = %s")
-            params.append(check_id)
+            clauses.append("check_id = :check_id")
+            params["check_id"] = check_id
         if payload_id is not None:
-            clauses.append("payload_id = %s")
-            params.append(payload_id)
+            clauses.append("payload_id = :payload_id")
+            params["payload_id"] = payload_id
         if source_payload_ref is not None:
-            clauses.append("source_payload_ref = %s")
-            params.append(source_payload_ref)
+            clauses.append("source_payload_ref = :source_payload_ref")
+            params["source_payload_ref"] = source_payload_ref
         if metric_id is not None:
-            clauses.append("metric_id = %s")
-            params.append(metric_id)
+            clauses.append("metric_id = :metric_id")
+            params["metric_id"] = metric_id
         where = " AND ".join(clauses)
-        total = self.conn.execute(
-            f"SELECT COUNT(*) AS n FROM evaluation_results WHERE {where}",  # noqa: S608
-            params,
-        ).fetchone()["n"]
-        rows = self.conn.execute(
+        filters = {key: value for key, value in params.items() if key not in {"limit", "offset"}}
+        total = self._one(
+            f"SELECT COUNT(*) AS n FROM evaluation_results WHERE {where}", filters
+        )["n"]
+        rows = self._all(
             f"""
             SELECT * FROM evaluation_results WHERE {where}
             ORDER BY created_at, check_id
-            OFFSET %s LIMIT %s
-            """,  # noqa: S608
-            [*params, offset, limit],
-        ).fetchall()
-        return int(total), [self._to_entity(r) for r in rows]
+            OFFSET :offset LIMIT :limit
+            """,
+            params,
+        )
+        return int(total), [self._to_entity(row) for row in rows]
 
     def count_by_job(self, job_id: uuid.UUID) -> int:
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM evaluation_results WHERE job_id = %s",
-            (job_id,),
-        ).fetchone()
+        row = self._one(
+            "SELECT COUNT(*) AS n FROM evaluation_results WHERE job_id = :job_id",
+            {"job_id": job_id},
+        )
         return int(row["n"])
 
     def summary_by_job(self, job_id: uuid.UUID) -> dict[str, Any]:
-        """Aggregate pass rate and score per check, computed in PostgreSQL."""
-        overall = self.conn.execute(
+        overall = self._one(
             """
             SELECT
                 COUNT(*) AS total,
@@ -182,27 +182,24 @@ class ResultRepository(BaseRepository):
                 COUNT(*) FILTER (WHERE status = 'NOT_APPLICABLE') AS not_applicable,
                 COUNT(*) FILTER (WHERE status = 'ERROR') AS errored,
                 AVG(score) AS avg_score
-            FROM evaluation_results WHERE job_id = %s
+            FROM evaluation_results WHERE job_id = :job_id
             """,
-            (job_id,),
-        ).fetchone()
-        per_check = self.conn.execute(
+            {"job_id": job_id},
+        )
+        per_check = self._all(
             """
-            SELECT check_id,
-                   check_type,
-                   COUNT(*) AS total,
+            SELECT check_id, check_type, COUNT(*) AS total,
                    COUNT(*) FILTER (WHERE status = 'PASSED') AS passed,
                    COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
                    COUNT(*) FILTER (WHERE status = 'NOT_APPLICABLE') AS not_applicable,
                    COUNT(*) FILTER (WHERE status = 'ERROR') AS errored,
                    AVG(score) AS avg_score
-            FROM evaluation_results WHERE job_id = %s
+            FROM evaluation_results WHERE job_id = :job_id
             GROUP BY check_id, check_type
             ORDER BY check_id
             """,
-            (job_id,),
-        ).fetchall()
-
+            {"job_id": job_id},
+        )
         total = int(overall["total"] or 0)
         passed = int(overall["passed"] or 0)
         scored = passed + int(overall["failed"] or 0)
@@ -219,17 +216,17 @@ class ResultRepository(BaseRepository):
             else None,
             "checks": [
                 {
-                    "check_id": r["check_id"],
-                    "check_type": r["check_type"],
-                    "total": int(r["total"]),
-                    "passed": int(r["passed"]),
-                    "failed": int(r["failed"]),
-                    "not_applicable": int(r["not_applicable"]),
-                    "errored": int(r["errored"]),
-                    "avg_score": round(float(r["avg_score"]), 4)
-                    if r["avg_score"] is not None
+                    "check_id": row["check_id"],
+                    "check_type": row["check_type"],
+                    "total": int(row["total"]),
+                    "passed": int(row["passed"]),
+                    "failed": int(row["failed"]),
+                    "not_applicable": int(row["not_applicable"]),
+                    "errored": int(row["errored"]),
+                    "avg_score": round(float(row["avg_score"]), 4)
+                    if row["avg_score"] is not None
                     else None,
                 }
-                for r in per_check
+                for row in per_check
             ],
         }

@@ -1,7 +1,7 @@
-"""PostgreSQL access built directly on psycopg 3.
+"""SQLAlchemy engine and sessions.
 
-There is no ORM here by design: repositories issue native parameterized SQL and
-callers control transaction boundaries explicitly through `transaction()`.
+Callers own transaction boundaries through `transaction()` or `Session.begin()`.
+psycopg 3 is the PostgreSQL driver under SQLAlchemy.
 """
 
 from __future__ import annotations
@@ -9,77 +9,102 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import contextmanager
 
-from psycopg import Connection
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 
-_pool: ConnectionPool | None = None
+_engine: Engine | None = None
+_session_factory: sessionmaker[Session] | None = None
 
 
-def _configure_connection(conn: Connection) -> None:
-    """Pin every pooled connection to the configured schema."""
-    if settings.pgschema and settings.pgschema != "public":
-        # Identifier validated by Settings; SET does not accept bind parameters.
-        conn.execute(f"SET search_path TO {settings.pgschema}, public")
-        conn.commit()
-
-
-def get_pool() -> ConnectionPool:
-    global _pool
-    if _pool is None:
-        _pool = ConnectionPool(
-            conninfo=settings.conninfo,
-            min_size=settings.db_pool_min_size,
-            max_size=settings.db_pool_max_size,
-            kwargs={"row_factory": dict_row, "autocommit": False},
-            configure=_configure_connection,
-            open=True,
+def get_engine() -> Engine:
+    global _engine, _session_factory
+    if _engine is None:
+        options = (
+            f"-c statement_timeout={settings.db_statement_timeout_ms} "
+            f"-c idle_in_transaction_session_timeout="
+            f"{settings.db_idle_in_transaction_timeout_ms}"
         )
-    return _pool
+        _engine = create_engine(
+            settings.sqlalchemy_url,
+            pool_size=max(settings.db_pool_max_size, 1),
+            max_overflow=0,
+            pool_pre_ping=True,
+            pool_timeout=settings.db_connect_timeout,
+            connect_args={
+                "connect_timeout": settings.db_connect_timeout,
+                "options": options,
+            },
+        )
+        if settings.pgschema and settings.pgschema != "public":
+            schema = settings.pgschema
+
+            @event.listens_for(_engine, "connect")
+            def _set_search_path(dbapi_connection, _connection_record) -> None:
+                cursor = dbapi_connection.cursor()
+                cursor.execute(f"SET search_path TO {schema}, public")
+                cursor.close()
+
+        _session_factory = sessionmaker(bind=_engine, expire_on_commit=False, autoflush=False)
+    return _engine
+
+
+def _factory() -> sessionmaker[Session]:
+    get_engine()
+    assert _session_factory is not None
+    return _session_factory
 
 
 def close_pool() -> None:
-    global _pool
-    if _pool is not None:
-        _pool.close()
-        _pool = None
+    """Dispose the engine. Name kept so the runner and API lifespan stay the same."""
+    global _engine, _session_factory
+    if _engine is not None:
+        _engine.dispose()
+        _engine = None
+        _session_factory = None
 
 
 def reset_pool() -> None:
-    """Drop the pool so the next call rebuilds it from current settings (tests)."""
     close_pool()
 
 
-def connect(*, autocommit: bool = False) -> Connection:
-    """Open a standalone connection outside the pool (migrations, scripts)."""
-    conn = Connection.connect(settings.conninfo, row_factory=dict_row, autocommit=autocommit)
-    if settings.pgschema and settings.pgschema != "public":
-        conn.execute(f"SET search_path TO {settings.pgschema}, public")
-        if not autocommit:
-            conn.commit()
-    return conn
-
-
-def get_conn() -> Generator[Connection, None, None]:
-    """FastAPI dependency yielding a pooled connection."""
-    with get_pool().connection() as conn:
-        yield conn
-
-
 @contextmanager
-def transaction() -> Generator[Connection, None, None]:
-    """Explicit transaction boundary: commits on success, rolls back on error."""
-    with get_pool().connection() as conn:
-        with conn.transaction():
-            yield conn
+def transaction() -> Generator[Session, None, None]:
+    """Commit on success, roll back on error."""
+    session = _factory()()
+    try:
+        with session.begin():
+            yield session
+    finally:
+        session.close()
+
+
+def open_session() -> Session:
+    return _factory()()
+
+
+def get_session() -> Generator[Session, None, None]:
+    """FastAPI dependency. The endpoint opens `session.begin()` when it writes."""
+    session = _factory()()
+    try:
+        yield session
+    finally:
+        session.close()
 
 
 def healthcheck() -> tuple[bool, str]:
     try:
-        with get_pool().connection() as conn:
-            conn.execute("SELECT 1")
+        with get_engine().connect() as connection:
+            connection.execute(text("SELECT 1"))
         return True, "ok"
     except Exception as exc:  # pragma: no cover - depends on server state
-        return False, f"error: {exc}"
+        from app.core.logging import get_logger
+
+        get_logger(__name__).error(
+            "database_healthcheck_failed",
+            error_type=type(exc).__name__,
+            error_code="SERVICE_UNAVAILABLE",
+        )
+        return False, "unavailable"

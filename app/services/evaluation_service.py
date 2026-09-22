@@ -9,9 +9,9 @@ Flow, all of it PostgreSQL-driven for durable state:
         -> result upserted, ticket transitioned, job progress recomputed
 
     The payload is re-read from the temporary dataset folder using the ticket's
-    source_dataset_id + source_payload_ref. The metric configuration is taken
-    from the ticket's immutable metric_snapshot_json, never from the currently
-    active metric_records row. LLM calls happen outside any database transaction.
+    source_dataset_id + source_payload_ref. The check is taken from the ticket's
+    immutable metric_snapshot_json, which was copied from config.json at job
+    creation. LLM calls happen outside any database transaction.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from psycopg.errors import DeadlockDetected
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.database import transaction
@@ -40,10 +41,11 @@ from app.models.enums import (
 )
 from app.repositories.job_repository import JobRepository
 from app.repositories.result_repository import ResultRepository
-from app.repositories.ticket_repository import TicketRepository
+from app.repositories.ticket_repository import StaleWorkerError, TicketRepository
 from app.services.context_resolver import ResolvedInput, resolve_input_mapping
 from app.services.dataset_folder import load_source_payload
 from app.services.errors import (
+    EvaluationError,
     MissingContextError,
     PermanentEvaluationError,
     SourcePayloadMissingError,
@@ -104,12 +106,36 @@ def _applies(
     return True, ""
 
 
+_DEADLOCK_SQLSTATE = "40P01"
+
+
+def is_postgres_deadlock(exc: BaseException) -> bool:
+    """True when the exception is a PostgreSQL deadlock (SQLSTATE 40P01).
+
+    SQLAlchemy surfaces the psycopg error as OperationalError.orig.
+    """
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, DeadlockDetected):
+            return True
+        if getattr(current, "sqlstate", None) == _DEADLOCK_SQLSTATE:
+            return True
+        nxt = getattr(current, "orig", None)
+        if not isinstance(nxt, BaseException):
+            nxt = current.__cause__
+        current = nxt if isinstance(nxt, BaseException) else None
+    return False
+
+
 def _persist(
     ticket: EvaluationTicket,
     output: EvaluatorOutput,
     resolved: ResolvedInput | None,
     *,
     target: TicketStatus,
+    worker_id: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
     delay_seconds: float | None = None,
@@ -118,9 +144,13 @@ def _persist(
 
     The parent job row is locked first so concurrent settlements of tickets
     on the same job cannot deadlock on the tickets→jobs foreign key.
+
+    A PostgreSQL deadlock during settlement is retried here. That persistence
+    retry does not consume an evaluation attempt. SQLAlchemy reports the
+    deadlock as OperationalError, with the psycopg error on ``orig``.
     """
     snapshot = resolved.as_snapshot() if resolved else None
-    last_deadlock: DeadlockDetected | None = None
+    last_deadlock: BaseException | None = None
     for attempt in range(5):
         try:
             return _persist_once(
@@ -128,14 +158,23 @@ def _persist(
                 output,
                 snapshot,
                 target=target,
+                worker_id=worker_id,
                 error_code=error_code,
                 error_message=error_message,
                 delay_seconds=delay_seconds,
             )
+        except StaleWorkerError:
+            return _stale_outcome(ticket, worker_id)
+        except OperationalError as exc:
+            if not is_postgres_deadlock(exc):
+                raise
+            last_deadlock = exc
+            time.sleep(0.05 * (attempt + 1))
         except DeadlockDetected as exc:
             last_deadlock = exc
             time.sleep(0.05 * (attempt + 1))
-    raise last_deadlock  # pragma: no cover - exhausted retries still classified as transient
+    assert last_deadlock is not None
+    raise last_deadlock
 
 
 def _persist_once(
@@ -144,6 +183,7 @@ def _persist_once(
     snapshot: dict[str, Any] | None,
     *,
     target: TicketStatus,
+    worker_id: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
     delay_seconds: float | None = None,
@@ -169,6 +209,7 @@ def _persist_once(
                 error_code="CANCELLED",
                 error_message="job cancelled while ticket was running",
                 job_id=ticket.job_id,
+                worker_id=worker_id,
             )
             return TicketOutcome(
                 ticket_id=ticket.id,
@@ -217,6 +258,7 @@ def _persist_once(
             delay_seconds=delay_seconds,
             input_snapshot=snapshot,
             job_id=ticket.job_id,
+            worker_id=worker_id,
         )
 
     return TicketOutcome(
@@ -230,9 +272,25 @@ def _persist_once(
     )
 
 
+def _stale_outcome(ticket: EvaluationTicket, worker_id: str | None) -> TicketOutcome:
+    logger.warning(
+        "stale_worker_settlement_rejected",
+        ticket_id=str(ticket.id),
+        job_id=str(ticket.job_id),
+        worker_id=worker_id,
+    )
+    return TicketOutcome(
+        ticket_id=ticket.id,
+        status=TicketStatus.RUNNING,
+        error_code="STALE_WORKER",
+        error_message="ticket is no longer owned by this worker",
+    )
+
+
 def execute_ticket(ticket: EvaluationTicket, *, worker_id: str | None = None) -> TicketOutcome:
     """Evaluate one claimed ticket and persist everything durably."""
     resolved: ResolvedInput | None = None
+    owner = worker_id or ticket.worker_id
     try:
         # ---------------------------------------------------------- load state
         with transaction() as conn:
@@ -288,6 +346,7 @@ def execute_ticket(ticket: EvaluationTicket, *, worker_id: str | None = None) ->
                 output,
                 resolved,
                 target=TicketStatus.NOT_APPLICABLE,
+                worker_id=owner,
                 error_code="NOT_APPLICABLE",
                 error_message=reason,
             )
@@ -313,6 +372,7 @@ def execute_ticket(ticket: EvaluationTicket, *, worker_id: str | None = None) ->
                     output,
                     resolved,
                     target=TicketStatus.NOT_APPLICABLE,
+                    worker_id=owner,
                     error_code="MISSING_CONTEXT",
                     error_message=message,
                 )
@@ -327,7 +387,7 @@ def execute_ticket(ticket: EvaluationTicket, *, worker_id: str | None = None) ->
             check_type=ticket.check_type,
             attempt=ticket.attempt_count,
             max_attempts=ticket.max_attempts,
-            worker_id=worker_id or ticket.worker_id,
+            worker_id=owner,
             config_snapshot=snapshot,
         )
         output = evaluator.run(dict(resolved.values), check, context)
@@ -347,6 +407,7 @@ def execute_ticket(ticket: EvaluationTicket, *, worker_id: str | None = None) ->
                     output,
                     resolved,
                     target=TicketStatus.RETRY,
+                    worker_id=owner,
                     error_code=output.error_code or "EVALUATOR_ERROR",
                     error_message=output.error_message or output.explanation,
                     delay_seconds=delay,
@@ -356,6 +417,7 @@ def execute_ticket(ticket: EvaluationTicket, *, worker_id: str | None = None) ->
                 output,
                 resolved,
                 target=TicketStatus.FAILED,
+                worker_id=owner,
                 error_code=output.error_code or "EVALUATOR_ERROR",
                 error_message=output.error_message or output.explanation,
             )
@@ -366,53 +428,69 @@ def execute_ticket(ticket: EvaluationTicket, *, worker_id: str | None = None) ->
                 output,
                 resolved,
                 target=TicketStatus.NOT_APPLICABLE,
+                worker_id=owner,
                 error_code=output.error_code or "NOT_APPLICABLE",
                 error_message=output.explanation,
             )
 
         # PASSED and FAILED verdicts both mean the evaluation ran: ticket is DONE.
-        return _persist(ticket, output, resolved, target=TicketStatus.DONE)
+        return _persist(ticket, output, resolved, target=TicketStatus.DONE, worker_id=owner)
 
     except JobCancelled:
-        with transaction() as conn:
-            if TicketRepository(conn).get(ticket.id) is None:
-                return TicketOutcome(
-                    ticket_id=ticket.id, status=TicketStatus.FAILED, error_code="TICKET_GONE"
+        try:
+            with transaction() as conn:
+                if TicketRepository(conn).get(ticket.id) is None:
+                    return TicketOutcome(
+                        ticket_id=ticket.id, status=TicketStatus.FAILED, error_code="TICKET_GONE"
+                    )
+                settle_ticket(
+                    conn,
+                    ticket.id,
+                    TicketStatus.CANCELLED,
+                    error_code="CANCELLED",
+                    error_message="job cancellation requested",
+                    job_id=ticket.job_id,
+                    worker_id=owner,
                 )
-            settle_ticket(
-                conn,
-                ticket.id,
-                TicketStatus.CANCELLED,
-                error_code="CANCELLED",
-                error_message="job cancellation requested",
-                job_id=ticket.job_id,
-            )
+        except StaleWorkerError:
+            return _stale_outcome(ticket, owner)
         return TicketOutcome(
             ticket_id=ticket.id, status=TicketStatus.CANCELLED, error_code="CANCELLED"
         )
 
+    except StaleWorkerError:
+        return _stale_outcome(ticket, owner)
+
     except Exception as exc:  # noqa: BLE001 - failures are classified, not swallowed
-        return _handle_failure(ticket, exc, resolved)
+        return _handle_failure(ticket, exc, resolved, worker_id=owner)
 
 
 def _handle_failure(
-    ticket: EvaluationTicket, exc: BaseException, resolved: ResolvedInput | None
+    ticket: EvaluationTicket,
+    exc: BaseException,
+    resolved: ResolvedInput | None,
+    *,
+    worker_id: str | None = None,
 ) -> TicketOutcome:
     """Classify a failure and move the ticket to RETRY, FAILED, or NOT_APPLICABLE."""
     error_class = classify_error(exc)
     code = error_code_for(exc)
     message = str(exc)[:2000]
-
-    logger.warning(
-        "ticket_failed",
-        ticket_id=str(ticket.id),
-        check_id=ticket.check_id,
-        error_class=error_class.value,
-        error_code=code,
-        error=message,
-        attempt=ticket.attempt_count,
-        max_attempts=ticket.max_attempts,
-    )
+    log_fields = {
+        "ticket_id": str(ticket.id),
+        "job_id": str(ticket.job_id),
+        "worker_id": worker_id,
+        "check_id": ticket.check_id,
+        "error_class": error_class.value,
+        "error_code": code,
+        "error": message,
+        "attempt": ticket.attempt_count,
+        "max_attempts": ticket.max_attempts,
+    }
+    if isinstance(exc, EvaluationError):
+        logger.warning("ticket_failed", **log_fields)
+    else:
+        logger.exception("ticket_failed", **log_fields)
 
     if error_class is ErrorClass.MISSING_CONTEXT:
         output = EvaluatorOutput(
@@ -430,26 +508,31 @@ def _handle_failure(
             output,
             resolved,
             target=TicketStatus.FAILED,
+            worker_id=worker_id,
             error_code=code,
             error_message=message,
         )
 
     if error_class is ErrorClass.TRANSIENT and ticket.attempt_count < ticket.max_attempts:
         delay = settings.backoff_for_attempt(ticket.attempt_count)
-        with transaction() as conn:
-            if TicketRepository(conn).get(ticket.id) is None:
-                return TicketOutcome(
-                    ticket_id=ticket.id, status=TicketStatus.FAILED, error_code="TICKET_GONE"
+        try:
+            with transaction() as conn:
+                if TicketRepository(conn).get(ticket.id) is None:
+                    return TicketOutcome(
+                        ticket_id=ticket.id, status=TicketStatus.FAILED, error_code="TICKET_GONE"
+                    )
+                settle_ticket(
+                    conn,
+                    ticket.id,
+                    TicketStatus.RETRY,
+                    error_code=code,
+                    error_message=message,
+                    delay_seconds=delay,
+                    job_id=ticket.job_id,
+                    worker_id=worker_id,
                 )
-            settle_ticket(
-                conn,
-                ticket.id,
-                TicketStatus.RETRY,
-                error_code=code,
-                error_message=message,
-                delay_seconds=delay,
-                job_id=ticket.job_id,
-            )
+        except StaleWorkerError:
+            return _stale_outcome(ticket, worker_id)
         return TicketOutcome(
             ticket_id=ticket.id,
             status=TicketStatus.RETRY,
@@ -474,6 +557,7 @@ def _handle_failure(
         output,
         resolved,
         target=TicketStatus.FAILED,
+        worker_id=worker_id,
         error_code=final_code,
         error_message=message,
     )

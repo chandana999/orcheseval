@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import uuid
+
+from sqlalchemy import text
 
 from app.core.database import transaction
 from app.evaluators.llm.providers.base import LLMResponse
@@ -13,13 +17,7 @@ from app.repositories.ticket_repository import TicketRepository
 from app.services.evaluation_service import execute_ticket
 from app.services.ticket_service import claim_tickets
 from runner.runner import EvaluationRunner
-from tests.conftest import (
-    make_payload,
-    seed_default_profile,
-    seed_metric,
-    seed_profile,
-    write_dataset,
-)
+from tests.conftest import make_payload, write_dataset
 
 
 def drain(**kwargs) -> EvaluationRunner:
@@ -36,20 +34,31 @@ def drain(**kwargs) -> EvaluationRunner:
 
 
 def _job_from_payloads(client, temp_root, payloads, checks=None):
-    from app.core import database
-
-    with database.transaction() as conn:
-        if checks is None:
-            seed_default_profile(conn)
-        else:
-            records = [seed_metric(conn, check) for check in checks]
-            seed_profile(conn, records)
-
     dataset_id = f"run-{uuid.uuid4().hex[:8]}"
-    write_dataset(temp_root, dataset_id, payloads)
+    write_dataset(temp_root, dataset_id, payloads, checks=checks)
     response = client.post("/v1/evaluation-jobs", json={"dataset_id": dataset_id})
     assert response.status_code == 201, response.text
     return response.json()["job"], dataset_id
+
+
+def test_graceful_shutdown_does_not_leave_running_tickets(seeded_job):
+    runner = EvaluationRunner(
+        worker_id="w-stop",
+        max_concurrency=2,
+        claim_batch_size=2,
+        poll_interval=0.05,
+        recovery_interval=1000.0,
+        drain=False,
+    )
+    thread = threading.Thread(target=runner.run_forever)
+    thread.start()
+    time.sleep(0.2)
+    runner.request_stop()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    with transaction() as conn:
+        counts = TicketRepository(conn).counts_by_status(uuid.UUID(seeded_job["job"]["id"]))
+        assert counts.get("RUNNING", 0) == 0
 
 
 def test_runner_evaluates_every_ticket_and_completes_the_job(seeded_job, client):
@@ -152,23 +161,22 @@ def test_retrying_a_ticket_does_not_duplicate_results(seeded_job, client):
         assert ResultRepository(conn).count_by_job(job_id) == 6
         tickets = TicketRepository(conn).list_by_job(job_id)[1]
         conn.execute(
-            """
-            UPDATE evaluation_tickets
-            SET status = 'READY', attempt_count = 0, result_id = NULL, available_at = now()
-            WHERE id = %s
-            """,
-            (tickets[0].id,),
+            text(
+                """
+                UPDATE evaluation_tickets
+                SET status = 'READY', attempt_count = 0, result_id = NULL, available_at = now()
+                WHERE id = :id
+                """
+            ),
+            {"id": tickets[0].id},
         )
     drain()
     with transaction() as conn:
         assert ResultRepository(conn).count_by_job(job_id) == 6
         rows = conn.execute(
-            """
-            SELECT COUNT(*) AS n FROM evaluation_results
-            WHERE ticket_id = %s
-            """,
-            (tickets[0].id,),
-        ).fetchone()
+            text("SELECT COUNT(*) AS n FROM evaluation_results WHERE ticket_id = :id"),
+            {"id": tickets[0].id},
+        ).mappings().one()
         assert rows["n"] == 1
 
 
@@ -294,12 +302,14 @@ def test_two_runners_share_the_workload_without_overlap(client, temp_root, deter
     with transaction() as conn:
         assert ResultRepository(conn).count_by_job(uuid.UUID(job["id"])) == 18
         rows = conn.execute(
-            """
-            SELECT COUNT(DISTINCT worker_id) AS workers FROM evaluation_tickets
-            WHERE job_id = %s
-            """,
-            (uuid.UUID(job["id"]),),
-        ).fetchone()
+            text(
+                """
+                SELECT COUNT(DISTINCT worker_id) AS workers FROM evaluation_tickets
+                WHERE job_id = :job_id
+                """
+            ),
+            {"job_id": uuid.UUID(job["id"])},
+        ).mappings().one()
         assert rows["workers"] >= 1
 
 

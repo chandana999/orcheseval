@@ -1,5 +1,4 @@
-"""Custom verifiers ported from eval-orchestrator (regex, contains_all, json_keys,
-length_bounds). Reused by the field comparison evaluator."""
+"""Custom verifiers for field comparison: regex, contains_all, json_keys, and length_bounds."""
 
 from __future__ import annotations
 

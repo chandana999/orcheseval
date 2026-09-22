@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
-from app.core import database
 from tests.conftest import (
+    DEFAULT_AGENT_ID,
     make_payload,
-    seed_default_profile,
-    seed_metric,
     write_dataset,
 )
 
@@ -44,8 +43,8 @@ def test_job_creation_fans_out_one_ticket_per_payload_and_metric(seeded_job, cli
         "summary_present",
         "workflow_sequence",
     ]
-    assert created["profiles"] == ["agent-response-quality-v1"]
-    assert created["tickets_summary"]["by_profile"]["agent-response-quality-v1"] == 6
+    assert created["profiles"] == [DEFAULT_AGENT_ID]
+    assert created["tickets_summary"]["by_agent"][DEFAULT_AGENT_ID] == 6
 
     job = client.get(f"/v1/evaluation-jobs/{created['job']['id']}").json()
     assert job["status"] == "READY"
@@ -59,40 +58,25 @@ def test_job_creation_fans_out_one_ticket_per_payload_and_metric(seeded_job, cli
     assert {t["status"] for t in tickets["items"]} == {"READY"}
     assert tickets["items"][0]["check_id"] == "summary_present"
     assert tickets["items"][0]["priority"] == 5
-    assert tickets["items"][0]["evaluation_profile_id"] == "agent-response-quality-v1"
+    assert tickets["items"][0]["evaluation_profile_id"] == DEFAULT_AGENT_ID
     assert tickets["items"][0]["source_payload_ref"].endswith(".json")
 
 
-def test_job_snapshot_is_immune_to_later_metric_changes(client, temp_root):
-    with database.transaction() as db:
-        records = seed_default_profile(db)
-        original_id = records[0].metric_record_id
-
+def test_job_snapshot_is_immune_to_later_config_changes(client, temp_root):
     dataset_id = f"ds-{uuid.uuid4().hex[:6]}"
-    write_dataset(temp_root, dataset_id, [make_payload()])
+    folder = write_dataset(temp_root, dataset_id, [make_payload()])
     created = client.post("/v1/evaluation-jobs", json={"dataset_id": dataset_id}).json()
     job_id = created["job"]["id"]
 
-    with database.transaction() as db:
-        new_check = {
-            "check_id": "summary_present",
-            "evaluator": "required_fields",
-            "input_mapping": {"summary": "summarizer.output.summary"},
-            "params": {"fields": ["summary", "nonexistent"]},
-        }
-        seed_metric(db, new_check, metric_id="summary_present", version=2)
-        db.execute(
-            "UPDATE metric_records SET is_active_indicator = FALSE WHERE metric_record_id = %s",
-            (original_id,),
-        )
+    config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    config["agents"][0]["checks"][0]["params"] = {"fields": ["summary", "nonexistent"]}
+    (folder / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
     tickets = client.get(f"/v1/evaluation-jobs/{job_id}/tickets").json()["items"]
     summary = next(t for t in tickets if t["check_id"] == "summary_present")
-    assert summary["metric_version_number"] == 1
-    assert summary["metric_record_id"] == str(original_id)
     detail = client.get(f"/v1/tickets/{summary['id']}").json()
-    assert detail["metric_snapshot_json"]["metric_version_number"] == 1
-    assert detail["metric_snapshot_json"]["metric_record_id"] == str(original_id)
+    assert detail["metric_snapshot_json"]["definition_payload"]["params"]["fields"] == ["summary"]
+    assert detail["metric_snapshot_json"]["agent_id"] == DEFAULT_AGENT_ID
 
 
 def test_job_requires_dataset_id(client):
@@ -119,7 +103,7 @@ def test_retry_failed_requires_failed_tickets(seeded_job, client):
     job_id = seeded_job["job"]["id"]
     response = client.post(f"/v1/evaluation-jobs/{job_id}/retry-failed")
     assert response.status_code == 409
-    assert "no failed tickets" in response.json()["detail"]
+    assert "no failed tickets" in response.json()["error"]["message"]
 
 
 def test_unknown_ids_return_404(client):

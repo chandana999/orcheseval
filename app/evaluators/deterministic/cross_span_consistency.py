@@ -141,8 +141,7 @@ class CrossSpanConsistencyEvaluator(Evaluator):
 class FieldComparisonEvaluator(Evaluator):
     """Compare a mapped actual value against a mapped or literal expected value.
 
-    Reuses the exact/fuzzy/semantic scoring and the custom verifiers ported from
-    eval-orchestrator.
+    Reuses exact, fuzzy, and semantic scoring, plus the custom verifiers.
 
     Config params::
 

@@ -12,8 +12,8 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health", response_model=HealthResponse)
 def health_check() -> HealthResponse:
-    postgres_ok, postgres = healthcheck()
-    services = {"api": "ok", "postgres": postgres}
+    postgres_ok, _postgres = healthcheck()
+    services = {"api": "ok", "postgres": "ok" if postgres_ok else "unavailable"}
     return HealthResponse(
         status="healthy" if postgres_ok else "degraded",
         version=__version__,
@@ -28,10 +28,11 @@ def liveness() -> dict:
 
 @router.get("/health/ready")
 def readiness() -> JSONResponse:
-    postgres_ok, postgres = healthcheck()
+    """Ready only when PostgreSQL answers. The body never includes the driver error."""
+    postgres_ok, _postgres = healthcheck()
     if postgres_ok:
-        return JSONResponse({"status": "ready", "postgres": postgres})
-    return JSONResponse({"status": "not_ready", "postgres": postgres}, status_code=503)
+        return JSONResponse({"status": "ready", "postgres": "ok"})
+    return JSONResponse({"status": "not_ready", "postgres": "unavailable"}, status_code=503)
 
 
 @router.get("/metrics")

@@ -1,11 +1,8 @@
 from app.models.entities import (
     EvaluationJob,
-    EvaluationProfile,
-    EvaluationProfileMetric,
     EvaluationResult,
     EvaluationTicket,
     JobProgress,
-    MetricRecord,
 )
 from app.models.enums import (
     ALLOWED_TICKET_TRANSITIONS,
@@ -26,14 +23,11 @@ __all__ = [
     "CheckType",
     "ErrorClass",
     "EvaluationJob",
-    "EvaluationProfile",
-    "EvaluationProfileMetric",
     "EvaluationResult",
     "EvaluationTicket",
     "IllegalTicketTransition",
     "JobProgress",
     "JobStatus",
-    "MetricRecord",
     "OnMissingContext",
     "ResultStatus",
     "TicketStatus",

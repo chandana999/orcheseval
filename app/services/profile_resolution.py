@@ -1,20 +1,18 @@
-"""Extract evaluation_profile_id from a payload and freeze mapped metrics.
+"""Match a payload to checks in the dataset config file.
 
-The profile id is taken only from payload.agent_registry.evaluation_profile_id.
-It is never inferred from producer, workflow, agent name, or spans.
+The dataset folder holds payload JSON files plus config.json. A payload is
+matched by payload.agent_registry.agent_id to an agent entry in that file.
+The matched checks are frozen onto each ticket.
 """
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from psycopg import Connection
-
 from app.core.config import settings
-from app.models.entities import MetricRecord
 from app.models.enums import CheckType
-from app.repositories.profile_repository import ProfileRepository
 from app.services.metric_validation import MetricDefinitionError, normalize_metric_definition
 
 
@@ -26,158 +24,122 @@ class ProfileNotFoundError(ProfileResolutionError):
     status_code = 404
 
 
-class InactiveProfileError(ProfileResolutionError):
-    status_code = 409
-
-
-def extract_evaluation_profile_id(payload: dict[str, Any], *, source: str) -> str:
-    """Read payload['agent_registry']['evaluation_profile_id']."""
+def extract_agent_id(payload: dict[str, Any], *, source: str) -> str:
+    """Read payload['agent_registry']['agent_id']."""
     registry = payload.get("agent_registry")
     if registry is None:
         raise ProfileResolutionError(
-            f"{source}: missing agent_registry; expected "
-            "payload.agent_registry.evaluation_profile_id"
+            f"{source}: missing agent_registry; expected payload.agent_registry.agent_id"
         )
     if not isinstance(registry, dict):
         raise ProfileResolutionError(
             f"{source}: agent_registry must be an object, got {type(registry).__name__}"
         )
-    profile_id = registry.get("evaluation_profile_id")
-    if profile_id is None or (isinstance(profile_id, str) and not profile_id.strip()):
+    agent_id = registry.get("agent_id")
+    if agent_id is None or (isinstance(agent_id, str) and not agent_id.strip()):
         raise ProfileResolutionError(
-            f"{source}: agent_registry.evaluation_profile_id is required and must be non-empty"
+            f"{source}: agent_registry.agent_id is required and must be non-empty"
         )
-    if not isinstance(profile_id, str):
-        raise ProfileResolutionError(
-            f"{source}: agent_registry.evaluation_profile_id must be a string"
-        )
-    return profile_id.strip()
+    if not isinstance(agent_id, str):
+        raise ProfileResolutionError(f"{source}: agent_registry.agent_id must be a string")
+    return agent_id.strip()
 
 
-def freeze_metric_snapshot(
-    record: MetricRecord,
-    *,
-    evaluation_profile_id: str,
-    defaults: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Normalize and freeze the metric definition used for this ticket.
-
-    Later changes to metric_records or the active version cannot affect retries:
-    the ticket stores this snapshot and the runner reads it from the ticket row.
-    """
-    default_policy = {
+def freeze_check(check: dict[str, Any], *, agent_id: str) -> dict[str, Any]:
+    """Normalize one config check and freeze it for a ticket."""
+    defaults = {
         "priority": 0,
         "max_attempts": settings.runner_max_attempts,
         "on_missing_context": settings.default_on_missing_context,
     }
-    if defaults:
-        default_policy.update(defaults)
-
-    definition = record.definition_payload
-    if not isinstance(definition, dict):
-        raise ProfileResolutionError(
-            f"metric record {record.metric_record_id} has an invalid definition_payload"
-        )
-
-    # Allow a wrapped {"checks": [one check]} or a bare check object.
-    if "checks" in definition and isinstance(definition.get("checks"), list):
-        if len(definition["checks"]) != 1:
-            raise ProfileResolutionError(
-                f"metric record {record.metric_record_id} definition_payload.checks "
-                "must contain exactly one check"
-            )
-        raw_check = dict(definition["checks"][0] or {})
-    else:
-        raw_check = dict(definition)
-
-    if not raw_check.get("check_id") and not raw_check.get("id"):
-        raw_check["check_id"] = record.metric_code or record.metric_id
-
+    check_id = str(check.get("check_id") or check.get("id") or "").strip() or "check"
     try:
-        check = normalize_metric_definition(
-            raw_check,
-            where=f"metric {record.metric_id} v{record.metric_version_number}",
-            defaults=default_policy,
+        normalized = normalize_metric_definition(
+            dict(check),
+            where=f"config.json agent {agent_id} check {check_id}",
+            defaults=defaults,
         )
     except MetricDefinitionError as exc:
         raise ProfileResolutionError(
-            f"metric record {record.metric_record_id} ({record.metric_id}) is invalid: {exc}"
+            f"config.json agent {agent_id!r} check {check_id!r} is invalid: {exc}"
         ) from exc
 
-    declared_type = (record.metric_type or "").upper()
-    if declared_type:
-        try:
-            CheckType(declared_type)
-        except ValueError as exc:
-            raise ProfileResolutionError(
-                f"metric record {record.metric_record_id} has invalid metric_type "
-                f"{record.metric_type!r}"
-            ) from exc
-        if declared_type != check["check_type"]:
-            raise ProfileResolutionError(
-                f"metric record {record.metric_record_id} metric_type {declared_type} "
-                f"does not match evaluator '{check['evaluator']}' ({check['check_type']})"
-            )
-
+    metric_record_id = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"eval-platform:{agent_id}:{normalized['check_id']}"
+    )
     snapshot = {
-        "metric_record_id": str(record.metric_record_id),
-        "metric_id": record.metric_id,
-        "metric_code": record.metric_code,
-        "metric_name": record.metric_name,
-        "metric_desc": record.metric_desc,
-        "metric_type": check["check_type"],
-        "metric_version_number": record.metric_version_number,
-        "definition_payload": check,
-        "default_threshold_operator": record.default_threshold_operator,
-        "llm_model_name": record.llm_model_name,
-        "llm_model_version": record.llm_model_version,
-        "llm_deployed_id": record.llm_deployed_id,
-        "evaluation_profile_id": evaluation_profile_id,
+        "metric_record_id": str(metric_record_id),
+        "metric_id": normalized["check_id"],
+        "metric_code": normalized["check_id"],
+        "metric_name": normalized["check_id"],
+        "metric_desc": normalized.get("description"),
+        "metric_type": normalized["check_type"],
+        "metric_version_number": 1,
+        "definition_payload": normalized,
+        "agent_id": agent_id,
+        "evaluation_profile_id": agent_id,
         "frozen_at": datetime.now(timezone.utc).isoformat(),
     }
-    if record.llm_model_name or check["check_type"] == CheckType.LLM_JUDGE.value:
+    if normalized["check_type"] == CheckType.LLM_JUDGE.value:
         snapshot["model"] = {
-            "model": record.llm_model_name or settings.judge_model,
+            "model": settings.judge_model,
             "provider": settings.default_provider,
         }
     return snapshot
 
 
-def load_profile_metrics(
-    conn: Connection, evaluation_profile_id: str, *, source: str
-) -> tuple[Any, list[MetricRecord], list[dict[str, Any]]]:
-    """Load an active profile and freeze each mapped metric version."""
-    profiles = ProfileRepository(conn)
-    profile = profiles.get(evaluation_profile_id)
-    if profile is None:
+def checks_for_agent(
+    config: dict[str, Any], agent_id: str, *, source: str
+) -> list[dict[str, Any]]:
+    """Return frozen checks for the config.json entry with this agent_id."""
+    agents = config.get("agents")
+    if not isinstance(agents, list) or not agents:
+        raise ProfileResolutionError(f"{source}: config.json must contain a non-empty agents list")
+
+    seen: set[str] = set()
+    matched: dict[str, Any] | None = None
+    for entry in agents:
+        if not isinstance(entry, dict):
+            raise ProfileResolutionError(f"{source}: each config.json agents entry must be an object")
+        entry_id = entry.get("agent_id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            raise ProfileResolutionError(
+                f"{source}: each config.json agent requires a non-empty agent_id"
+            )
+        key = entry_id.strip()
+        if key in seen:
+            raise ProfileResolutionError(f"{source}: config.json lists agent_id {key!r} more than once")
+        seen.add(key)
+        if key == agent_id:
+            matched = entry
+
+    if matched is None:
         raise ProfileNotFoundError(
-            f"{source}: evaluation profile {evaluation_profile_id!r} was not found"
-        )
-    if not profile.is_active:
-        raise InactiveProfileError(
-            f"{source}: evaluation profile {evaluation_profile_id!r} is inactive"
+            f"{source}: agent_id {agent_id!r} was not found in config.json"
         )
 
-    records = profiles.list_metric_records(profile.id)
-    if not records:
+    raw_checks = matched.get("checks")
+    if not isinstance(raw_checks, list) or not raw_checks:
         raise ProfileResolutionError(
-            f"{source}: evaluation profile {evaluation_profile_id!r} has no mapped metrics"
+            f"{source}: config.json agent {agent_id!r} has no checks"
         )
 
     snapshots: list[dict[str, Any]] = []
-    seen_records: set[str] = set()
-    for record in records:
-        key = str(record.metric_record_id)
-        if key in seen_records:
+    seen_checks: set[str] = set()
+    for raw in raw_checks:
+        if not isinstance(raw, dict):
             raise ProfileResolutionError(
-                f"{source}: duplicate metric mapping {record.metric_id} on profile "
-                f"{evaluation_profile_id!r}"
+                f"{source}: checks for agent {agent_id!r} must be objects"
             )
-        seen_records.add(key)
-        snapshots.append(
-            freeze_metric_snapshot(record, evaluation_profile_id=evaluation_profile_id)
-        )
-    return profile, records, snapshots
+        frozen = freeze_check(raw, agent_id=agent_id)
+        check_id = frozen["definition_payload"]["check_id"]
+        if check_id in seen_checks:
+            raise ProfileResolutionError(
+                f"{source}: duplicate check_id {check_id!r} for agent {agent_id!r}"
+            )
+        seen_checks.add(check_id)
+        snapshots.append(frozen)
+    return snapshots
 
 
 def check_from_snapshot(metric_snapshot: dict[str, Any]) -> dict[str, Any] | None:

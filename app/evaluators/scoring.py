@@ -1,8 +1,7 @@
-"""Text comparison primitives reused from eval-orchestrator.
+"""Text comparison primitives.
 
-`normalize`, `score_exact`, `score_fuzzy`, `score_semantic`, and the hash/OpenAI
-embedding backend are ported from the source project so comparison behaviour
-stays identical; only the imports and the return type changed.
+`normalize`, `score_exact`, `score_fuzzy`, and `score_semantic` compare text.
+Semantic comparison uses a hash embedding or the OpenAI embedding API.
 """
 
 from __future__ import annotations

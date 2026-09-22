@@ -1,42 +1,49 @@
+"""Session helpers shared by repositories."""
+
 from __future__ import annotations
 
-import uuid
+import json
 from enum import Enum
 from typing import Any
 
-from psycopg import Connection
-from psycopg.types.json import Jsonb
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.orm import Session
+
+
+def _json(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value)
 
 
 class BaseRepository:
-    """Shared helpers for hand-written SQL repositories.
+    """Repositories take the caller's Session so the caller owns the transaction."""
 
-    Every repository takes the caller's connection so the caller owns the
-    transaction boundary.
-    """
-
-    def __init__(self, conn: Connection) -> None:
-        self.conn = conn
+    def __init__(self, session: Session) -> None:
+        self.session = session
 
     @staticmethod
     def _enum(cls: type[Enum], value: Any) -> Any:
-        if value is None:
-            return None
-        if isinstance(value, cls):
+        if value is None or isinstance(value, cls):
             return value
         return cls(value)
 
-    @staticmethod
-    def _uuid(value: Any) -> uuid.UUID | None:
-        if value is None:
-            return None
-        if isinstance(value, uuid.UUID):
-            return value
-        return uuid.UUID(str(value))
+    def _one(self, sql: str, params: dict[str, Any] | None = None) -> Any:
+        return self.session.execute(text(sql), params or {}).mappings().first()
 
-    @staticmethod
-    def _json(value: Any) -> Jsonb | None:
-        """Wrap a Python value for a JSONB column, preserving explicit nulls."""
-        if value is None:
-            return None
-        return Jsonb(value)
+    def _all(self, sql: str, params: dict[str, Any] | None = None) -> list[Any]:
+        return list(self.session.execute(text(sql), params or {}).mappings().all())
+
+    def _run(self, sql: str, params: dict[str, Any] | None = None) -> CursorResult[Any]:
+        return self.session.execute(text(sql), params or {})
+
+    def _all_in(self, sql: str, *, key: str, values: list[Any], extra: dict[str, Any] | None = None) -> list[Any]:
+        statement = text(sql).bindparams(bindparam(key, expanding=True))
+        params = {key: list(values), **(extra or {})}
+        return list(self.session.execute(statement, params).mappings().all())
+
+    def _run_in(self, sql: str, *, key: str, values: list[Any], extra: dict[str, Any] | None = None) -> CursorResult[Any]:
+        statement = text(sql).bindparams(bindparam(key, expanding=True))
+        params = {key: list(values), **(extra or {})}
+        return self.session.execute(statement, params)

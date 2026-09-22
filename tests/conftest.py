@@ -26,26 +26,19 @@ os.environ["RUNNER_RETRY_BACKOFF_SECONDS"] = "0,0,0"
 os.environ["RATE_LIMIT"] = "10000/minute"
 
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 
 from app.core import database  # noqa: E402
 from app.core.config import settings  # noqa: E402
-from app.db.migration_runner import upgrade  # noqa: E402
-from app.models.entities import EvaluationProfile, MetricRecord  # noqa: E402
-from app.models.enums import CheckType  # noqa: E402
-from app.repositories.metric_repository import MetricRepository  # noqa: E402
-from app.repositories.profile_repository import ProfileRepository  # noqa: E402
-
+from app.db.migrate import upgrade  # noqa: E402
 API_HEADERS = {"X-API-Key": "test-api-key"}
 
-DEFAULT_PROFILE_ID = "agent-response-quality-v1"
+DEFAULT_AGENT_ID = "support-triage-agent"
 
 TABLES = [
     "evaluation_results",
     "evaluation_tickets",
     "evaluation_jobs",
-    "evaluation_profile_metrics",
-    "evaluation_profiles",
-    "metric_records",
 ]
 
 
@@ -53,17 +46,13 @@ TABLES = [
 def database_ready() -> None:
     """Verify connectivity and apply migrations, or skip with a clear reason."""
     try:
-        conn = database.connect()
+        upgrade()
     except Exception as exc:  # pragma: no cover - environment dependent
         pytest.skip(
             f"PostgreSQL database '{settings.pgdatabase}' is unavailable ({exc}). "
             "Ask an administrator to run scripts/setup_databases.sql as superuser.",
             allow_module_level=True,
         )
-    try:
-        upgrade(conn)
-    finally:
-        conn.close()
     yield
     database.close_pool()
 
@@ -71,14 +60,18 @@ def database_ready() -> None:
 @pytest.fixture(autouse=True)
 def clean_tables(database_ready) -> None:
     with database.transaction() as conn:
-        conn.execute(f"TRUNCATE {', '.join(TABLES)} CASCADE")
+        conn.execute(text(f"TRUNCATE {', '.join(TABLES)} CASCADE"))
     yield
 
 
 @pytest.fixture
 def conn():
-    with database.get_pool().connection() as connection:
-        yield connection
+    session = database.open_session()
+    try:
+        yield session
+    finally:
+        session.rollback()
+        session.close()
 
 
 @pytest.fixture
@@ -104,7 +97,7 @@ def make_payload(
     include_summarizer: bool = True,
     tool_response: bool = True,
     spans_out_of_order: bool = False,
-    evaluation_profile_id: str | None = DEFAULT_PROFILE_ID,
+    agent_id: str | None = DEFAULT_AGENT_ID,
     include_agent_registry: bool = True,
 ) -> dict[str, Any]:
     """A representative multi-agent execution payload."""
@@ -168,10 +161,9 @@ def make_payload(
     }
     if include_agent_registry:
         payload["agent_registry"] = {
-            "agent_id": "support-triage-agent",
+            "agent_id": agent_id,
             "agent_name": "Support Triage Agent",
             "agent_version": "1.0",
-            "evaluation_profile_id": evaluation_profile_id,
         }
     return payload
 
@@ -219,95 +211,36 @@ def deterministic_config() -> dict[str, Any]:
     return copy.deepcopy(DETERMINISTIC_CONFIG)
 
 
-def write_dataset(root: Path, dataset_id: str, payloads: list[dict[str, Any]]) -> Path:
+def write_dataset(
+    root: Path,
+    dataset_id: str,
+    payloads: list[dict[str, Any]],
+    *,
+    checks: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+    agent_id: str = DEFAULT_AGENT_ID,
+) -> Path:
     folder = root / dataset_id
     folder.mkdir(parents=True, exist_ok=True)
     for index, payload in enumerate(payloads, start=1):
         (folder / f"payload_{index:03d}.json").write_text(json.dumps(payload), encoding="utf-8")
+    document = config or {
+        "agents": [{"agent_id": agent_id, "checks": checks or DETERMINISTIC_CHECKS}]
+    }
+    (folder / "config.json").write_text(json.dumps(document), encoding="utf-8")
     return folder
-
-
-def seed_metric(
-    conn,
-    check: dict[str, Any],
-    *,
-    metric_id: str | None = None,
-    version: int = 1,
-    active: bool = True,
-) -> MetricRecord:
-    check_id = check["check_id"]
-    evaluator = check.get("evaluator") or (
-        "llm_judge"
-        if str(check.get("check_type", "")).upper() == "LLM_JUDGE"
-        else "required_fields"
-    )
-    metric_type = (
-        CheckType.LLM_JUDGE.value
-        if evaluator == "llm_judge" or str(check.get("check_type", "")).upper() == "LLM_JUDGE"
-        else CheckType.DETERMINISTIC.value
-    )
-    record = MetricRecord(
-        metric_record_id=uuid.uuid4(),
-        metric_id=metric_id or check_id,
-        metric_code=check_id,
-        metric_name=check_id.replace("_", " "),
-        metric_desc=check.get("description"),
-        metric_type=metric_type,
-        metric_version_number=version,
-        definition_payload=dict(check),
-        default_threshold_operator=None,
-        llm_model_name=None,
-        llm_model_version=None,
-        llm_deployed_id=None,
-        is_active_indicator=active,
-        previous_metric_record_id=None,
-        change_summary=None,
-    )
-    return MetricRepository(conn).insert(record)
-
-
-def seed_profile(
-    conn,
-    records: list[MetricRecord],
-    *,
-    profile_id: str = DEFAULT_PROFILE_ID,
-    active: bool = True,
-    name: str | None = None,
-) -> EvaluationProfile:
-    profiles = ProfileRepository(conn)
-    profile = profiles.insert(
-        EvaluationProfile(
-            evaluation_profile_id=profile_id,
-            name=name or profile_id,
-            version=1,
-            description=None,
-            is_active=active,
-        )
-    )
-    for index, record in enumerate(records):
-        profiles.add_metric(
-            profile_id=profile.id,
-            metric_record_id=record.metric_record_id,
-            metric_id=record.metric_id,
-            execution_order=index,
-        )
-    return profile
-
-
-def seed_default_profile(conn, checks: list[dict[str, Any]] | None = None) -> list[MetricRecord]:
-    records = [seed_metric(conn, check) for check in (checks or DETERMINISTIC_CHECKS)]
-    seed_profile(conn, records)
-    return records
 
 
 @pytest.fixture
 def seeded_job(client: TestClient, temp_root: Path, deterministic_config: dict[str, Any]):
-    """Create a profile with three metrics, two payload files, and a job over them."""
-    with database.transaction() as conn:
-        seed_default_profile(conn, deterministic_config["checks"])
-
+    """Two payload files and a config with three checks, then a job over them."""
     dataset_id = f"dataset-{uuid.uuid4().hex[:8]}"
-    write_dataset(temp_root, dataset_id, [make_payload(), make_payload(category="technical")])
+    write_dataset(
+        temp_root,
+        dataset_id,
+        [make_payload(), make_payload(category="technical")],
+        checks=deterministic_config["checks"],
+    )
 
     job_response = client.post(
         "/v1/evaluation-jobs", json={"dataset_id": dataset_id, "name": "nightly"}

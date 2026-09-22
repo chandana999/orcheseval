@@ -19,12 +19,17 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from app.core.config import settings
-from app.core.database import close_pool, get_pool, transaction
+from app.core.database import close_pool, get_engine, transaction
 from app.core.logging import get_logger, setup_logging
 from app.models.entities import EvaluationTicket
 from app.services.evaluation_service import execute_ticket
 from app.services.recovery_service import reconcile_active_jobs, recover_abandoned_tickets
-from app.services.ticket_service import build_worker_id, claim_tickets, refresh_ticket_gauges
+from app.services.ticket_service import (
+    build_worker_id,
+    claim_tickets,
+    heartbeat_ticket,
+    refresh_ticket_gauges,
+)
 
 logger = get_logger(__name__)
 
@@ -83,13 +88,42 @@ class EvaluationRunner:
         with self._lock:
             return max(0, self.max_concurrency - len(self._inflight))
 
+    def _heartbeat(self, ticket: EvaluationTicket, stop: threading.Event) -> None:
+        """Keep a long evaluation leased. A fast evaluation returns before this fires."""
+        interval = max(1.0, self.lease_seconds / 3)
+        while not stop.wait(interval):
+            try:
+                with transaction() as conn:
+                    extended = heartbeat_ticket(
+                        conn,
+                        ticket.id,
+                        worker_id=self.worker_id,
+                        lease_seconds=self.lease_seconds,
+                    )
+                if extended is None:
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "lease_heartbeat_failed",
+                    ticket_id=str(ticket.id),
+                    job_id=str(ticket.job_id),
+                    worker_id=self.worker_id,
+                    error=str(exc),
+                )
+
     def _run_ticket(self, ticket: EvaluationTicket) -> None:
+        stop_heartbeat = threading.Event()
+        beater = threading.Thread(
+            target=self._heartbeat, args=(ticket, stop_heartbeat), daemon=True
+        )
+        beater.start()
         try:
             outcome = execute_ticket(ticket, worker_id=self.worker_id)
             logger.info(
                 "ticket_settled",
                 ticket_id=str(ticket.id),
                 job_id=str(ticket.job_id),
+                worker_id=self.worker_id,
                 check_id=ticket.check_id,
                 evaluator=ticket.evaluator,
                 status=outcome.status.value,
@@ -103,12 +137,15 @@ class EvaluationRunner:
             logger.error(
                 "ticket_settlement_failed",
                 ticket_id=str(ticket.id),
+                job_id=str(ticket.job_id),
+                worker_id=self.worker_id,
                 error=str(exc),
                 exc_info=True,
             )
         finally:
             # Counted here rather than in a done callback: waiters are notified
             # before callbacks run, so the shutdown log could undercount.
+            stop_heartbeat.set()
             with self._lock:
                 self.processed += 1
 
@@ -167,7 +204,7 @@ class EvaluationRunner:
         return len(tickets)
 
     def run_forever(self) -> None:
-        get_pool()
+        get_engine()
         logger.info(
             "runner_started",
             worker_id=self.worker_id,

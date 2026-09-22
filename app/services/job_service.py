@@ -7,12 +7,14 @@ results. Each ticket freezes the exact metric record version used for execution.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
-from psycopg import Connection
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -29,8 +31,8 @@ from app.services.dataset_folder import (
 from app.services.payload_validation import PayloadValidationError, validate_payload
 from app.services.profile_resolution import (
     ProfileResolutionError,
-    extract_evaluation_profile_id,
-    load_profile_metrics,
+    checks_for_agent,
+    extract_agent_id,
 )
 
 logger = get_logger(__name__)
@@ -50,6 +52,7 @@ class JobCreationResult:
     profiles: list[str]
     warnings: list[str]
     tickets_summary: dict[str, Any]
+    replayed: bool = False
 
 
 def _wrap(exc: BaseException) -> JobCreationError:
@@ -58,65 +61,140 @@ def _wrap(exc: BaseException) -> JobCreationError:
     return error
 
 
+def _request_hash(
+    *,
+    dataset_id: str,
+    name: str | None,
+    priority: int | None,
+    max_attempts: int | None,
+) -> str:
+    body = json.dumps(
+        {
+            "dataset_id": dataset_id,
+            "name": name,
+            "priority": priority,
+            "max_attempts": max_attempts,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _result_for_existing_job(
+    session: Session, job: EvaluationJob, stored_hash: str | None, request_hash: str
+) -> JobCreationResult:
+    if stored_hash != request_hash:
+        error = JobCreationError("Idempotency-Key was already used for a different request")
+        error.status_code = 409
+        raise error
+    snapshot = job.config_snapshot_json or {}
+    agents = snapshot.get("agents") or {}
+    profiles = list(agents)
+    metric_ids: list[str] = []
+    for agent_doc in agents.values():
+        for metric in agent_doc.get("metrics") or []:
+            metric_id = metric.get("metric_id")
+            if metric_id and metric_id not in metric_ids:
+                metric_ids.append(metric_id)
+    by_agent: dict[str, int] = defaultdict(int)
+    for payload in snapshot.get("payloads") or []:
+        agent_id = payload.get("agent_id")
+        metrics = (agents.get(agent_id) or {}).get("metrics") or []
+        if agent_id:
+            by_agent[agent_id] += len(metrics)
+    counts = TicketRepository(session).counts_by_status(job.id)
+    return JobCreationResult(
+        job=job,
+        ticket_count=job.total_tickets,
+        payload_count=job.payload_count,
+        dataset_id=job.dataset_id or "",
+        metric_ids=metric_ids,
+        profiles=profiles,
+        warnings=[],
+        tickets_summary={"by_agent": dict(by_agent), "by_status": counts},
+        replayed=True,
+    )
+
+
 def create_job(
-    conn: Connection,
+    session: Session,
     *,
     dataset_id: str,
     name: str | None = None,
     priority: int | None = None,
     max_attempts: int | None = None,
+    idempotency_key: str | None = None,
 ) -> JobCreationResult:
     """Create a job and one ticket per payload file x mapped metric.
 
     Everything happens in the caller's transaction. A failure before COMMIT
     leaves no job or ticket rows.
     """
+    key = idempotency_key.strip() if idempotency_key else None
+    if idempotency_key is not None and not key:
+        raise JobCreationError("Idempotency-Key is empty")
+    if key is not None and len(key) > 200:
+        raise JobCreationError("Idempotency-Key is too long")
+    request_hash = (
+        _request_hash(
+            dataset_id=dataset_id, name=name, priority=priority, max_attempts=max_attempts
+        )
+        if key
+        else None
+    )
+    jobs = JobRepository(session)
+    if key:
+        existing = jobs.get_by_idempotency_key(key)
+        if existing is not None:
+            return _result_for_existing_job(session, existing[0], existing[1], request_hash or "")
+
     try:
         folder = read_dataset_folder(dataset_id)
     except (DatasetFolderError, PayloadValidationError) as exc:
         raise _wrap(exc) from exc
 
     default_max_attempts = max_attempts or settings.runner_max_attempts
-    profile_cache: dict[str, tuple[Any, list, list[dict[str, Any]]]] = {}
+    agent_cache: dict[str, list[dict[str, Any]]] = {}
     prepared: list[tuple[PayloadFile, uuid.UUID, str, list[dict[str, Any]]]] = []
     warnings = list(folder.warnings)
     metric_ids: list[str] = []
-    profiles_used: list[str] = []
+    agents_used: list[str] = []
 
     for payload_file in folder.payloads:
         source = payload_file.filename
         try:
             report = validate_payload(payload_file.payload)
             warnings.extend(f"{source}: {w}" for w in report.get("warnings") or [])
-            profile_id = extract_evaluation_profile_id(payload_file.payload, source=source)
-            if profile_id not in profile_cache:
-                profile_cache[profile_id] = load_profile_metrics(conn, profile_id, source=source)
-                profiles_used.append(profile_id)
-            _profile, _records, snapshots = profile_cache[profile_id]
+            agent_id = extract_agent_id(payload_file.payload, source=source)
+            if agent_id not in agent_cache:
+                agent_cache[agent_id] = checks_for_agent(folder.config, agent_id, source=source)
+                agents_used.append(agent_id)
+            snapshots = agent_cache[agent_id]
         except (PayloadValidationError, ProfileResolutionError) as exc:
             raise _wrap(exc) from exc
 
         payload_uuid = uuid.uuid4()
-        prepared.append((payload_file, payload_uuid, profile_id, snapshots))
+        prepared.append((payload_file, payload_uuid, agent_id, snapshots))
 
     tickets: list[EvaluationTicket] = []
     snapshot_doc: dict[str, Any] = {
         "dataset_id": dataset_id,
         "payloads": [],
-        "profiles": {},
+        "agents": {},
     }
 
-    for payload_file, payload_uuid, profile_id, snapshots in prepared:
+    for payload_file, payload_uuid, agent_id, snapshots in prepared:
         snapshot_doc["payloads"].append(
             {
                 "file": payload_file.filename,
                 "payload_id": payload_file.payload_id,
-                "evaluation_profile_id": profile_id,
+                "agent_id": agent_id,
                 "synthetic_payload_id": str(payload_uuid),
             }
         )
-        if profile_id not in snapshot_doc["profiles"]:
-            snapshot_doc["profiles"][profile_id] = {
+        if agent_id not in snapshot_doc["agents"]:
+            snapshot_doc["agents"][agent_id] = {
                 "metrics": [
                     {
                         "metric_record_id": s["metric_record_id"],
@@ -142,7 +220,7 @@ def create_job(
                     metric_record_id=uuid.UUID(frozen["metric_record_id"]),
                     metric_id=frozen["metric_id"],
                     metric_version_number=int(frozen["metric_version_number"]),
-                    evaluation_profile_id=profile_id,
+                    evaluation_profile_id=agent_id,
                     metric_snapshot_json=frozen,
                     check_id=check["check_id"],
                     check_type=CheckType(check["check_type"]),
@@ -171,20 +249,21 @@ def create_job(
         not_applicable_tickets=0,
         created_at=None,
     )
-    jobs = JobRepository(conn)
-    job = jobs.insert(job)
+    job = jobs.insert(
+        job, idempotency_key=key, idempotency_request_hash=request_hash
+    )
     for ticket in tickets:
         ticket.job_id = job.id
 
-    created = TicketRepository(conn).bulk_insert(tickets)
+    created = TicketRepository(session).bulk_insert(tickets)
     jobs.set_total_tickets(job.id, total=created, status=JobStatus.READY)
     job = jobs.get(job.id)
     assert job is not None
 
     unique_metrics = list(dict.fromkeys(metric_ids))
-    by_profile: dict[str, int] = defaultdict(int)
+    by_agent: dict[str, int] = defaultdict(int)
     for ticket in tickets:
-        by_profile[ticket.evaluation_profile_id] += 1
+        by_agent[ticket.evaluation_profile_id] += 1
 
     JOBS_CREATED.inc()
     TICKETS_CREATED.inc(created)
@@ -194,7 +273,7 @@ def create_job(
         dataset_id=dataset_id,
         payload_count=len(prepared),
         ticket_count=created,
-        profiles=profiles_used,
+        profiles=agents_used,
     )
     return JobCreationResult(
         job=job,
@@ -202,10 +281,10 @@ def create_job(
         payload_count=len(prepared),
         dataset_id=dataset_id,
         metric_ids=unique_metrics,
-        profiles=profiles_used,
+        profiles=agents_used,
         warnings=warnings,
         tickets_summary={
-            "by_profile": dict(by_profile),
+            "by_agent": dict(by_agent),
             "by_status": {"READY": created},
         },
     )
@@ -219,14 +298,14 @@ class CancellationResult:
     progress: JobProgress | None
 
 
-def cancel_job(conn: Connection, job_id: uuid.UUID) -> CancellationResult:
+def cancel_job(session: Session, job_id: uuid.UUID) -> CancellationResult:
     """Request cancellation and cancel every unclaimed ticket, atomically.
 
     Tickets already RUNNING are left alone: the runner notices the cancellation
     before persisting and settles them as CANCELLED, and the recovery sweep
     catches any whose runner died. Execution history is preserved either way.
     """
-    jobs = JobRepository(conn)
+    jobs = JobRepository(session)
     job = jobs.get_for_update(job_id)
     if job is None:
         error = JobCreationError(f"job {job_id} not found")
@@ -238,7 +317,7 @@ def cancel_job(conn: Connection, job_id: uuid.UUID) -> CancellationResult:
         raise error
 
     jobs.request_cancellation(job_id)
-    cancelled = TicketRepository(conn).cancel_unclaimed(job_id)
+    cancelled = TicketRepository(session).cancel_unclaimed(job_id)
     progress = jobs.recompute_progress(job_id)
     updated = jobs.get(job_id)
     assert updated is not None
@@ -250,14 +329,14 @@ def cancel_job(conn: Connection, job_id: uuid.UUID) -> CancellationResult:
     )
 
 
-def retry_failed_tickets(conn: Connection, job_id: uuid.UUID) -> tuple[EvaluationJob, int]:
+def retry_failed_tickets(session: Session, job_id: uuid.UUID) -> tuple[EvaluationJob, int]:
     """Reset FAILED tickets to READY so the runner picks them up again.
 
     Retries keep the same job, ticket, payload reference, metric record, metric
     version, and frozen configuration snapshot. The active metric configuration
     is not re-resolved.
     """
-    jobs = JobRepository(conn)
+    jobs = JobRepository(session)
     job = jobs.get_for_update(job_id)
     if job is None:
         error = JobCreationError(f"job {job_id} not found")
@@ -268,7 +347,7 @@ def retry_failed_tickets(conn: Connection, job_id: uuid.UUID) -> tuple[Evaluatio
         error.status_code = 409
         raise error
 
-    reset_ids = TicketRepository(conn).reset_failed(job_id)
+    reset_ids = TicketRepository(session).reset_failed(job_id)
     if not reset_ids:
         error = JobCreationError("no failed tickets to retry")
         error.status_code = 409
@@ -279,9 +358,9 @@ def retry_failed_tickets(conn: Connection, job_id: uuid.UUID) -> tuple[Evaluatio
     return updated, len(reset_ids)
 
 
-def job_status_payload(conn: Connection, job: EvaluationJob) -> dict[str, Any]:
+def job_status_payload(session: Session, job: EvaluationJob) -> dict[str, Any]:
     """Job view with counters recomputed from durable ticket state."""
-    counts = TicketRepository(conn).counts_by_status(job.id)
+    counts = TicketRepository(session).counts_by_status(job.id)
     terminal = sum(
         counts.get(status.value, 0)
         for status in (

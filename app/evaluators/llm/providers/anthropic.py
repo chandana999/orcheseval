@@ -1,4 +1,4 @@
-"""Anthropic messages provider. Ported from eval-orchestrator."""
+"""Anthropic messages provider."""
 
 import time
 from typing import Any

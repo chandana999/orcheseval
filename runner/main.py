@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         return run_default()
 
-    from app.core.database import close_pool
+    from app.core.database import close_pool  # noqa: F401 — disposed in finally
     from app.core.logging import setup_logging
 
     setup_logging()

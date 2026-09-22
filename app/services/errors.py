@@ -78,7 +78,7 @@ def classify_error(exc: BaseException) -> ErrorClass:
         return ErrorClass.TRANSIENT
     if isinstance(exc, TimeoutError):
         return ErrorClass.TRANSIENT
-    if isinstance(exc, (ValueError, TypeError, KeyError, LookupError)):
+    if isinstance(exc, (ValueError, TypeError, KeyError, LookupError, AttributeError)):
         return ErrorClass.PERMANENT
 
     message = str(exc).lower()

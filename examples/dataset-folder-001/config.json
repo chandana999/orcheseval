@@ -1,0 +1,38 @@
+{
+  "agents": [
+    {
+      "agent_id": "support-triage-agent",
+      "checks": [
+        {
+          "check_id": "summary_present",
+          "evaluator": "required_fields",
+          "input_mapping": {"summary": "summarizer.output.summary"},
+          "params": {"fields": ["summary"]},
+          "priority": 5
+        },
+        {
+          "check_id": "workflow_sequence",
+          "evaluator": "workflow_order",
+          "input_mapping": {"spans": "spans"},
+          "params": {
+            "expected_order": ["classifier", "validator", "summarizer"],
+            "mode": "subsequence"
+          }
+        },
+        {
+          "check_id": "policy_tool_called",
+          "evaluator": "tool_calls",
+          "input_mapping": {"tool_calls": "validator.tool_calls"},
+          "params": {"expected_tools": ["policy_lookup"], "require_response": true}
+        },
+        {
+          "check_id": "all_agents_ran",
+          "evaluator": "span_exists",
+          "input_mapping": {"spans": "spans"},
+          "params": {"required_spans": ["classifier", "validator", "summarizer"]},
+          "priority": 10
+        }
+      ]
+    }
+  ]
+}

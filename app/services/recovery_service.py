@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
-from psycopg import Connection
+from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger
 from app.core.metrics import TICKET_TRANSITIONS, TICKETS_RECOVERED
@@ -42,10 +42,10 @@ class RecoveryReport:
         }
 
 
-def recover_abandoned_tickets(conn: Connection, *, limit: int = 100) -> RecoveryReport:
+def recover_abandoned_tickets(session: Session, *, limit: int = 100) -> RecoveryReport:
     """Reclaim expired leases and settle running tickets on cancelled jobs."""
     report = RecoveryReport()
-    tickets = TicketRepository(conn)
+    tickets = TicketRepository(session)
     affected: set[uuid.UUID] = set()
 
     for ticket in tickets.recover_expired_leases(limit=limit):
@@ -69,7 +69,7 @@ def recover_abandoned_tickets(conn: Connection, *, limit: int = 100) -> Recovery
         TICKETS_RECOVERED.labels(outcome="cancelled").inc()
         TICKET_TRANSITIONS.labels(from_status="RUNNING", to_status="CANCELLED").inc()
 
-    jobs = JobRepository(conn)
+    jobs = JobRepository(session)
     for job_id in affected:
         jobs.recompute_progress(job_id)
         report.jobs_updated.append(str(job_id))
@@ -79,15 +79,15 @@ def recover_abandoned_tickets(conn: Connection, *, limit: int = 100) -> Recovery
     return report
 
 
-def reconcile_job(conn: Connection, job_id: uuid.UUID) -> None:
+def reconcile_job(session: Session, job_id: uuid.UUID) -> None:
     """Force a job's counters and status to match its ticket rows."""
-    JobRepository(conn).recompute_progress(job_id)
+    JobRepository(session).recompute_progress(job_id)
 
 
-def reconcile_active_jobs(conn: Connection) -> int:
+def reconcile_active_jobs(session: Session) -> int:
     """Recompute every job that still has non-terminal tickets (startup sweep)."""
-    jobs = JobRepository(conn)
-    job_ids = TicketRepository(conn).jobs_with_active_tickets()
+    jobs = JobRepository(session)
+    job_ids = TicketRepository(session).jobs_with_active_tickets()
     for job_id in job_ids:
         jobs.recompute_progress(job_id)
     return len(job_ids)
