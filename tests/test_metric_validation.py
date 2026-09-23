@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.metric_validation import (
+from evalorch.services.metric_validation import (
     MetricDefinitionError,
     normalize_metric_definition,
 )
@@ -45,13 +45,13 @@ def test_llm_judge_check_type_is_inferred():
 def test_evaluator_aliases_resolve():
     check = normalize(
         {
-            "check_id": "structure",
-            "evaluator": "output_structure",
-            "input_mapping": {"output": "classifier.output"},
-            "params": {"schema": {"type": "object"}},
+            "check_id": "sequence",
+            "evaluator": "workflow",
+            "input_mapping": {"spans": "spans"},
+            "params": {"expected_order": ["classifier", "validator"]},
         }
     )
-    assert check["evaluator"] == "json_schema"
+    assert check["evaluator"] == "workflow_order"
 
 
 def test_rejects_unknown_evaluator():
@@ -107,7 +107,7 @@ def test_inline_params_are_collected():
     assert check["params"]["required_spans"] == ["classifier"]
 
 
-def test_profile_defaults_are_applied():
+def test_metric_defaults_are_applied():
     check = normalize(
         {"check_id": "x", "evaluator": "required_fields"},
         defaults={"priority": 7, "max_attempts": 5, "on_missing_context": "fail"},

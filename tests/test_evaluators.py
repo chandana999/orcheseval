@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from app.evaluators.llm.providers.base import LLMResponse
-from app.evaluators.registry import get_evaluator
-from app.models.enums import ResultStatus
-from app.services.errors import InvalidEvaluatorConfigError, UnknownEvaluatorError
-from app.services.evaluation_service import evaluate_payload_check
+from evalorch.evaluators.llm.providers.base import LLMResponse
+from evalorch.evaluators.registry import get_evaluator
+from evalorch.models.enums import ResultStatus
+from evalorch.services.errors import InvalidEvaluatorConfigError, UnknownEvaluatorError
+from evalorch.services.evaluation_service import evaluate_payload_check
 from tests.conftest import make_payload
 
 
@@ -22,7 +22,7 @@ def test_required_fields_passes_and_fails():
     check = {
         "check_id": "c1",
         "evaluator": "required_fields",
-        "input_mapping": {"summary": "summarizer.output.summary"},
+        "input_mapping": {"summary": "summarizer.attributes.output.summary"},
         "params": {"fields": ["summary"]},
     }
     _resolved, output = run_check(payload, check)
@@ -34,33 +34,6 @@ def test_required_fields_passes_and_fails():
     assert output.evidence["missing"][0]["reason"] == "empty"
 
 
-def test_json_schema_validation_reports_violations():
-    payload = make_payload()
-    check = {
-        "check_id": "c2",
-        "evaluator": "json_schema",
-        "input_mapping": {"output": "classifier.output"},
-        "params": {
-            "target": "output",
-            "schema": {
-                "type": "object",
-                "required": ["category", "confidence"],
-                "properties": {
-                    "category": {"type": "string", "enum": ["billing", "technical"]},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                },
-            },
-        },
-    }
-    _resolved, output = run_check(payload, check)
-    assert output.passed is True
-
-    payload["spans"][0]["output"]["confidence"] = 4.2
-    _resolved, output = run_check(payload, check)
-    assert output.passed is False
-    assert any("above maximum" in v for v in output.evidence["violations"])
-
-
 def test_workflow_order_strict_and_subsequence():
     payload = make_payload()
     base = {
@@ -68,15 +41,81 @@ def test_workflow_order_strict_and_subsequence():
         "evaluator": "workflow_order",
         "input_mapping": {"spans": "spans"},
     }
-    strict = {**base, "params": {"expected_order": ["classifier", "validator", "summarizer"], "mode": "strict"}}
+    expected = ["classifier", "validator", "summarizer"]
+    strict = {**base, "params": {"expected_order": expected, "mode": "strict"}}
     _resolved, output = run_check(payload, strict)
     assert output.passed is True
+    assert output.evidence["mode"] == "strict"
 
     reordered = make_payload()
-    reordered["spans"][0]["order"] = 9  # classifier now runs last
+    reordered["trace_context"]["trace"]["spans"][0]["started_at"] = "2026-01-05T10:00:09Z"
     _resolved, output = run_check(reordered, strict)
     assert output.passed is False
     assert output.evidence["actual_order"][0] != "classifier"
+
+    with_extra = make_payload()
+    with_extra["trace_context"]["trace"]["spans"].append(
+        {
+            "span_id": "8888888888888888",
+            "trace_id": with_extra["correlation"]["trace_id"],
+            "parent_span_id": None,
+            "name": "retriever",
+            "kind": "internal",
+            "started_at": "2026-01-05T10:00:01Z",
+            "ended_at": "2026-01-05T10:00:01Z",
+            "duration_ms": 10,
+            "status": "ok",
+            "error_message": None,
+            "attributes": {},
+            "events": [],
+            "links": [],
+        }
+    )
+    named = {**base, "span_names": [*expected, "retriever"]}
+    subsequence = {**named, "params": {"expected_order": expected, "mode": "subsequence"}}
+    strict_with_extra = {**named, "params": {"expected_order": expected, "mode": "strict"}}
+    _resolved, output = run_check(with_extra, subsequence)
+    assert output.passed is True
+    assert output.evidence["mode"] == "subsequence"
+    assert output.evidence["actual_order"] == ["classifier", "retriever", "validator", "summarizer"]
+
+    _resolved, output = run_check(with_extra, strict_with_extra)
+    assert output.passed is False
+
+    _resolved, output = run_check(reordered, subsequence)
+    assert output.passed is False
+    assert "out of order" in output.explanation
+
+
+def test_ticket_mapping_does_not_receive_unnamed_spans():
+    payload = make_payload()
+    payload["trace_context"]["trace"]["spans"].append(
+        {
+            "span_id": "8888888888888888",
+            "trace_id": payload["correlation"]["trace_id"],
+            "parent_span_id": None,
+            "name": "retriever",
+            "kind": "internal",
+            "started_at": "2026-01-05T10:00:04Z",
+            "ended_at": "2026-01-05T10:00:04Z",
+            "duration_ms": 10,
+            "status": "ok",
+            "error_message": None,
+            "attributes": {"output": {"blob": "large"}},
+            "events": [],
+            "links": [],
+        }
+    )
+    check = {
+        "check_id": "summary_only",
+        "evaluator": "required_fields",
+        "span_names": ["summarizer"],
+        "input_mapping": {"summary": "summarizer.attributes.output.summary", "spans": "spans"},
+        "params": {"fields": ["summary"]},
+    }
+    resolved, output = run_check(payload, check)
+    assert output.passed is True
+    assert [span["name"] for span in resolved.values["spans"]] == ["summarizer"]
 
 
 def test_span_exists_flags_missing_agent():
@@ -97,7 +136,7 @@ def test_tool_calls_requires_response():
     check = {
         "check_id": "c5",
         "evaluator": "tool_calls",
-        "input_mapping": {"tool_calls": "validator.tool_calls"},
+        "input_mapping": {"tool_calls": "validator.attributes.tool_calls"},
         "params": {"expected_tools": ["policy_lookup"], "require_response": True},
     }
     _resolved, output = run_check(make_payload(), check)
@@ -106,63 +145,6 @@ def test_tool_calls_requires_response():
     _resolved, output = run_check(make_payload(tool_response=False), check)
     assert output.passed is False
     assert output.evidence["calls_without_response"] == ["policy_lookup"]
-
-
-def test_cross_span_consistency_detects_disagreement():
-    payload = make_payload()
-    check = {
-        "check_id": "c6",
-        "evaluator": "cross_span_consistency",
-        "input_mapping": {
-            "classified": "classifier.output.category",
-            "summarized": "summarizer.output.category",
-        },
-        "params": {
-            "comparisons": [
-                {"left": "classified", "right": "summarized", "method": "exact", "label": "category"}
-            ]
-        },
-    }
-    _resolved, output = run_check(payload, check)
-    assert output.passed is True
-
-    payload["spans"][2]["output"]["category"] = "technical"
-    _resolved, output = run_check(payload, check)
-    assert output.passed is False
-    assert output.evidence["comparisons"][0]["label"] == "category"
-
-
-def test_field_comparison_methods_and_verifier():
-    payload = make_payload()
-    fuzzy = {
-        "check_id": "c7",
-        "evaluator": "field_comparison",
-        "input_mapping": {"actual": "session_context.final_response"},
-        "params": {
-            "actual": "actual",
-            "expected_value": "the duplicate charge was refunded",
-            "method": "fuzzy",
-            "threshold": 60.0,
-        },
-    }
-    _resolved, output = run_check(payload, fuzzy)
-    assert output.passed is True
-
-    verifier = {
-        "check_id": "c8",
-        "evaluator": "field_comparison",
-        "input_mapping": {"actual": "session_context.final_response"},
-        "params": {
-            "actual": "actual",
-            "verifier": {"type": "contains_all", "contains": ["refunded", "duplicate"]},
-        },
-    }
-    _resolved, output = run_check(payload, verifier)
-    assert output.passed is True
-
-    semantic = {**fuzzy, "params": {**fuzzy["params"], "method": "semantic", "threshold": 0.99}}
-    _resolved, output = run_check(payload, semantic)
-    assert output.evidence["embedding_backend"] == "hash"
 
 
 def test_llm_judge_parses_verdict(monkeypatch):
@@ -178,15 +160,15 @@ def test_llm_judge_parses_verdict(monkeypatch):
             )
 
     monkeypatch.setattr(
-        "app.evaluators.llm.judge.get_llm_provider", lambda name=None: FakeProvider()
+        "evalorch.evaluators.llm.judge.get_llm_provider", lambda name=None: FakeProvider()
     )
     check = {
         "check_id": "judge",
         "check_type": "LLM_JUDGE",
         "evaluator": "llm_judge",
         "input_mapping": {
-            "summary": "summarizer.output.summary",
-            "conversation": "session_context.conversation_history",
+            "summary": "summarizer.attributes.output.summary",
+            "conversation": "classifier.attributes.conversation_history",
         },
         "params": {"criteria": "Is the summary faithful?", "model": "test-model"},
     }
@@ -203,13 +185,13 @@ def test_llm_judge_unparseable_response_is_an_error(monkeypatch):
             return LLMResponse(output="I cannot comply", latency_ms=5.0, model=model)
 
     monkeypatch.setattr(
-        "app.evaluators.llm.judge.get_llm_provider", lambda name=None: BadProvider()
+        "evalorch.evaluators.llm.judge.get_llm_provider", lambda name=None: BadProvider()
     )
     check = {
         "check_id": "judge",
         "check_type": "LLM_JUDGE",
         "evaluator": "llm_judge",
-        "input_mapping": {"summary": "summarizer.output.summary"},
+        "input_mapping": {"summary": "summarizer.attributes.output.summary"},
         "params": {"criteria": "Is the summary faithful?"},
     }
     _resolved, output = run_check(make_payload(), check)
@@ -226,8 +208,8 @@ def test_unknown_evaluator_and_bad_config_are_permanent_errors():
             make_payload(),
             {
                 "check_id": "bad",
-                "evaluator": "json_schema",
-                "input_mapping": {"output": "classifier.output"},
-                "params": {},
+                "evaluator": "tool_calls",
+                "input_mapping": {"spans": "spans"},
+                "params": {"expected_tools": ["policy_lookup"]},
             },
         )

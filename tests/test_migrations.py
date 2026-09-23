@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from app.core.config import settings
-from app.db.migrate import current, upgrade
+from evalorch.core.config import settings
+from evalorch.db.migrate import current, upgrade
 
 EXPECTED_TABLES = {
     "evaluation_jobs",
@@ -46,12 +46,12 @@ def test_all_expected_tables_exist(conn):
 
 
 def test_migration_ledger_is_complete_and_rerun_is_a_noop():
-    assert current() == "0002_job_idempotency"
+    assert current() == "0003_ticket_agent_id"
     assert upgrade() == []
 
 
 def test_enum_labels_match_the_domain_model(conn):
-    from app.models.enums import JobStatus, ResultStatus, TicketStatus
+    from evalorch.models.enums import JobStatus, ResultStatus, TicketStatus
 
     def labels(enum_name: str) -> set[str]:
         rows = conn.execute(
@@ -81,6 +81,21 @@ def test_claim_and_idempotency_indexes_exist(conn):
     ).mappings()
     names = {r["indexname"] for r in rows}
     assert "ix_tickets_claim" in names
+    assert "ix_tickets_agent" in names
+    assert "ix_tickets_profile" not in names
+
+    ticket_columns = conn.execute(
+        text(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = 'evaluation_tickets'
+            """
+        ),
+        {"schema": settings.pgschema},
+    ).mappings()
+    ticket_names = {row["column_name"] for row in ticket_columns}
+    assert "agent_id" in ticket_names
+    assert "evaluation_profile_id" not in ticket_names
     assert "ix_tickets_lease" in names
     assert "uq_tickets_job_payload_metric" in names
     assert "uq_results_ticket_id" in names

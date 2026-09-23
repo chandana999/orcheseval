@@ -12,21 +12,21 @@ from psycopg.errors import DeadlockDetected
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-from app.core.database import transaction
-from app.evaluators.base import EvaluatorOutput
-from app.models.entities import EvaluationResult, EvaluationTicket
-from app.models.enums import JobStatus, ResultStatus, TicketStatus
-from app.repositories.job_repository import JobRepository
-from app.repositories.result_repository import ResultRepository
-from app.repositories.ticket_repository import StaleWorkerError, TicketRepository
-from app.services import evaluation_service
-from app.services.errors import TransientEvaluationError
-from app.services.evaluation_service import execute_ticket
-from app.services.recovery_service import recover_abandoned_tickets
-from app.services.ticket_service import claim_tickets, heartbeat_ticket, settle_ticket
+from evalorch.core.database import transaction
+from evalorch.evaluators.base import EvaluatorOutput
+from evalorch.models.entities import EvaluationResult, EvaluationTicket
+from evalorch.models.enums import JobStatus, ResultStatus, TicketStatus
+from evalorch.repositories.job_repository import JobRepository
+from evalorch.repositories.result_repository import ResultRepository
+from evalorch.repositories.ticket_repository import StaleWorkerError, TicketRepository
+from evalorch.services import evaluation_service
+from evalorch.services.errors import TransientEvaluationError
+from evalorch.services.evaluation_service import execute_ticket
+from evalorch.services.recovery_service import recover_abandoned_tickets
+from evalorch.services.ticket_service import claim_tickets, heartbeat_ticket, settle_ticket
 from tests.conftest import (
     API_HEADERS,
-    DETERMINISTIC_CHECKS,
+    DETERMINISTIC_METRICS,
     make_payload,
     write_dataset,
 )
@@ -80,7 +80,7 @@ def _pad_ready_tickets(job_id: uuid.UUID, total: int) -> None:
                 metric_record_id=uuid.uuid4(),
                 metric_id=template.metric_id,
                 metric_version_number=template.metric_version_number,
-                evaluation_profile_id=template.evaluation_profile_id,
+                agent_id=template.agent_id,
                 metric_snapshot_json=template.metric_snapshot_json,
                 check_id=template.check_id,
                 check_type=template.check_type,
@@ -428,7 +428,7 @@ def test_transient_failure_then_success_uses_two_attempts(seeded_job, monkeypatc
         return _passed_output()
 
     monkeypatch.setattr(
-        "app.services.evaluation_service.get_evaluator", lambda _name: _scripted_evaluator(run)
+        "evalorch.services.evaluation_service.get_evaluator", lambda _name: _scripted_evaluator(run)
     )
     monkeypatch.setattr(
         evaluation_service.settings.__class__,
@@ -485,7 +485,7 @@ def test_attempts_stop_at_max_and_a_deadlock_retry_is_not_an_attempt(seeded_job,
         raise TransientEvaluationError("provider timeout")
 
     monkeypatch.setattr(
-        "app.services.evaluation_service.get_evaluator", lambda _name: _scripted_evaluator(run)
+        "evalorch.services.evaluation_service.get_evaluator", lambda _name: _scripted_evaluator(run)
     )
     monkeypatch.setattr(evaluation_service.time, "sleep", lambda _seconds: None)
     real_persist = evaluation_service._persist_once
@@ -560,7 +560,7 @@ def test_concurrent_idempotent_job_creation_inserts_one_job(seeded_job, temp_roo
     del temp_root
     from fastapi.testclient import TestClient
 
-    from app.main import app
+    from evalorch.main import app
 
     barrier = threading.Barrier(2)
     responses: list[tuple[int, str]] = []
@@ -628,7 +628,7 @@ def _make_job(client, temp_root, count: int, name: str) -> uuid.UUID:
         temp_root,
         dataset_id,
         [make_payload() for _ in range(count)],
-        checks=[DETERMINISTIC_CHECKS[0]],
+        metrics=[DETERMINISTIC_METRICS[0]],
     )
     response = client.post(
         "/v1/evaluation-jobs", json={"dataset_id": dataset_id, "name": name, "max_attempts": 3}
@@ -665,7 +665,7 @@ def test_mixed_jobs_finish_under_workers_retries_and_one_crash(seeded_job, clien
         return _passed_output()
 
     monkeypatch.setattr(
-        "app.services.evaluation_service.get_evaluator", lambda _name: _scripted_evaluator(run)
+        "evalorch.services.evaluation_service.get_evaluator", lambda _name: _scripted_evaluator(run)
     )
 
     with transaction() as conn:

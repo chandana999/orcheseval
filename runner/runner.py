@@ -18,13 +18,13 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from app.core.config import settings
-from app.core.database import close_pool, get_engine, transaction
-from app.core.logging import get_logger, setup_logging
-from app.models.entities import EvaluationTicket
-from app.services.evaluation_service import execute_ticket
-from app.services.recovery_service import reconcile_active_jobs, recover_abandoned_tickets
-from app.services.ticket_service import (
+from evalorch.core.config import settings
+from evalorch.core.database import close_pool, get_engine, transaction
+from evalorch.core.logging import get_logger, setup_logging
+from evalorch.models.entities import EvaluationTicket
+from evalorch.services.evaluation_service import execute_ticket
+from evalorch.services.recovery_service import reconcile_active_jobs, recover_abandoned_tickets
+from evalorch.services.ticket_service import (
     build_worker_id,
     claim_tickets,
     heartbeat_ticket,

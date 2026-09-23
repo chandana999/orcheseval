@@ -5,15 +5,15 @@ from __future__ import annotations
 from psycopg.errors import DeadlockDetected, QueryCanceled
 from sqlalchemy.exc import OperationalError
 
-from app.core.database import transaction
-from app.evaluators.base import EvaluatorOutput
-from app.models.enums import ResultStatus, TicketStatus
-from app.repositories.job_repository import JobRepository
-from app.repositories.result_repository import ResultRepository
-from app.repositories.ticket_repository import TicketRepository
-from app.services import evaluation_service
-from app.services.evaluation_service import execute_ticket, is_postgres_deadlock
-from app.services.ticket_service import claim_tickets
+from evalorch.core.database import transaction
+from evalorch.evaluators.base import EvaluatorOutput
+from evalorch.models.enums import ResultStatus, TicketStatus
+from evalorch.repositories.job_repository import JobRepository
+from evalorch.repositories.result_repository import ResultRepository
+from evalorch.repositories.ticket_repository import TicketRepository
+from evalorch.services import evaluation_service
+from evalorch.services.evaluation_service import execute_ticket, is_postgres_deadlock
+from evalorch.services.ticket_service import claim_tickets
 
 
 def _wrapped_deadlock() -> OperationalError:

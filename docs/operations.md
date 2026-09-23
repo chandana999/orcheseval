@@ -23,10 +23,12 @@ Current revisions: `0001_initial`, `0002_job_idempotency`.
 
 ## Processes
 
+The API package is `src/evalorch`. Imports are `evalorch.*`. Install the project in the virtual environment (`pip install -e .`) so uvicorn and the runner can import it.
+
 API:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+.\.venv\Scripts\python.exe -m uvicorn evalorch.main:app --host 127.0.0.1 --port 8001
 ```
 
 Runner:

@@ -34,8 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     ):
         return run_default()
 
-    from app.core.database import close_pool  # noqa: F401 — disposed in finally
-    from app.core.logging import setup_logging
+    from evalorch.core.database import close_pool  # noqa: F401 — disposed in finally
+    from evalorch.core.logging import setup_logging
 
     setup_logging()
     runner = EvaluationRunner(

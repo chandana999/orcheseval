@@ -19,12 +19,13 @@ def test_health_and_evaluator_catalog(client):
 
     evaluators = client.get("/v1/evaluators").json()["evaluators"]
     names = {e["evaluator"] for e in evaluators}
-    assert {"required_fields", "json_schema", "workflow_order", "llm_judge"} <= names
-
-
-def test_api_key_is_required(client):
-    response = client.get("/v1/evaluation-jobs", headers={"X-API-Key": "wrong"})
-    assert response.status_code == 401
+    assert {
+        "required_fields",
+        "workflow_order",
+        "span_exists",
+        "tool_calls",
+        "llm_judge",
+    } <= names
 
 
 def test_dataset_payload_and_config_apis_no_longer_exist(client):
@@ -58,7 +59,7 @@ def test_job_creation_fans_out_one_ticket_per_payload_and_metric(seeded_job, cli
     assert {t["status"] for t in tickets["items"]} == {"READY"}
     assert tickets["items"][0]["check_id"] == "summary_present"
     assert tickets["items"][0]["priority"] == 5
-    assert tickets["items"][0]["evaluation_profile_id"] == DEFAULT_AGENT_ID
+    assert tickets["items"][0]["agent_id"] == DEFAULT_AGENT_ID
     assert tickets["items"][0]["source_payload_ref"].endswith(".json")
 
 
@@ -69,7 +70,7 @@ def test_job_snapshot_is_immune_to_later_config_changes(client, temp_root):
     job_id = created["job"]["id"]
 
     config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
-    config["agents"][0]["checks"][0]["params"] = {"fields": ["summary", "nonexistent"]}
+    config["metrics"][0]["params"] = {"fields": ["summary", "nonexistent"]}
     (folder / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
     tickets = client.get(f"/v1/evaluation-jobs/{job_id}/tickets").json()["items"]

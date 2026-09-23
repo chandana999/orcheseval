@@ -8,14 +8,14 @@ import uuid
 
 from sqlalchemy import text
 
-from app.core.database import transaction
-from app.evaluators.llm.providers.base import LLMResponse
-from app.models.enums import JobStatus, TicketStatus
-from app.repositories.job_repository import JobRepository
-from app.repositories.result_repository import ResultRepository
-from app.repositories.ticket_repository import TicketRepository
-from app.services.evaluation_service import execute_ticket
-from app.services.ticket_service import claim_tickets
+from evalorch.core.database import transaction
+from evalorch.evaluators.llm.providers.base import LLMResponse
+from evalorch.models.enums import JobStatus, TicketStatus
+from evalorch.repositories.job_repository import JobRepository
+from evalorch.repositories.result_repository import ResultRepository
+from evalorch.repositories.ticket_repository import TicketRepository
+from evalorch.services.evaluation_service import execute_ticket
+from evalorch.services.ticket_service import claim_tickets
 from runner.runner import EvaluationRunner
 from tests.conftest import make_payload, write_dataset
 
@@ -33,9 +33,9 @@ def drain(**kwargs) -> EvaluationRunner:
     return runner
 
 
-def _job_from_payloads(client, temp_root, payloads, checks=None):
+def _job_from_payloads(client, temp_root, payloads, metrics=None):
     dataset_id = f"run-{uuid.uuid4().hex[:8]}"
-    write_dataset(temp_root, dataset_id, payloads, checks=checks)
+    write_dataset(temp_root, dataset_id, payloads, metrics=metrics)
     response = client.post("/v1/evaluation-jobs", json={"dataset_id": dataset_id})
     assert response.status_code == 201, response.text
     return response.json()["job"], dataset_id
@@ -112,14 +112,14 @@ def test_failing_check_is_recorded_as_a_failed_result_not_a_failed_ticket(
         client,
         temp_root,
         [make_payload(include_summarizer=False)],
-        checks=deterministic_config["checks"],
+        metrics=deterministic_config["metrics"],
     )
     drain()
 
     results = client.get(f"/v1/evaluation-jobs/{job['id']}/results").json()["items"]
     by_check = {r["check_id"]: r for r in results}
     assert by_check["summary_present"]["status"] == "NOT_APPLICABLE"
-    assert by_check["summary_present"]["error_code"] == "MISSING_CONTEXT"
+    assert by_check["summary_present"]["error_code"] == "NOT_APPLICABLE"
     assert by_check["workflow_sequence"]["status"] == "FAILED"
     assert by_check["workflow_sequence"]["evidence_json"]["missing_agents"] == ["summarizer"]
     assert by_check["policy_tool_called"]["status"] == "PASSED"
@@ -131,17 +131,20 @@ def test_failing_check_is_recorded_as_a_failed_result_not_a_failed_ticket(
 
 
 def test_missing_context_can_be_configured_to_fail(client, temp_root):
-    checks = [
-        {
-            "check_id": "strict_summary",
-            "evaluator": "required_fields",
-            "input_mapping": {"summary": "summarizer.output.summary"},
-            "on_missing_context": "fail",
-            "max_attempts": 1,
-        }
+    from tests.conftest import metric
+
+    metrics = [
+        metric(
+            "strict_summary",
+            "required_fields",
+            {"summary": "summarizer.attributes.output.summary"},
+            {"fields": ["summary"]},
+            on_missing_context="fail",
+            max_attempts=1,
+        )
     ]
     job, _ = _job_from_payloads(
-        client, temp_root, [make_payload(include_summarizer=False)], checks=checks
+        client, temp_root, [make_payload(include_summarizer=False)], metrics=metrics
     )
     drain()
 
@@ -188,18 +191,21 @@ def test_transient_failure_retries_then_fails_permanently(client, temp_root, mon
             raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(
-        "app.evaluators.llm.judge.get_llm_provider", lambda name=None: FlakyProvider()
+        "evalorch.evaluators.llm.judge.get_llm_provider", lambda name=None: FlakyProvider()
     )
-    checks = [
-        {
-            "check_id": "judge",
-            "check_type": "LLM_JUDGE",
-            "input_mapping": {"summary": "summarizer.output.summary"},
-            "params": {"criteria": "faithful?"},
-            "max_attempts": 2,
-        }
+    from tests.conftest import metric
+
+    metrics = [
+        metric(
+            "judge",
+            "llm_judge",
+            {"summary": "summarizer.attributes.output.summary"},
+            {"criteria": "faithful?"},
+            metric_type="llm_judge",
+            max_attempts=2,
+        )
     ]
-    job, _ = _job_from_payloads(client, temp_root, [make_payload()], checks=checks)
+    job, _ = _job_from_payloads(client, temp_root, [make_payload()], metrics=metrics)
     drain(max_concurrency=1, claim_batch_size=1)
 
     ticket = client.get(f"/v1/evaluation-jobs/{job['id']}/tickets").json()["items"][0]
@@ -226,20 +232,23 @@ def test_llm_judge_end_to_end_persists_evidence(client, temp_root, monkeypatch):
             )
 
     monkeypatch.setattr(
-        "app.evaluators.llm.judge.get_llm_provider", lambda name=None: FakeProvider()
+        "evalorch.evaluators.llm.judge.get_llm_provider", lambda name=None: FakeProvider()
     )
-    checks = [
-        {
-            "check_id": "summary_faithfulness",
-            "check_type": "LLM_JUDGE",
-            "input_mapping": {
-                "summary": "summarizer.output.summary",
-                "conversation": "session_context.conversation_history",
+    from tests.conftest import metric
+
+    metrics = [
+        metric(
+            "summary_faithfulness",
+            "llm_judge",
+            {
+                "summary": "summarizer.attributes.output.summary",
+                "conversation": "classifier.attributes.conversation_history",
             },
-            "params": {"criteria": "Does the summary reflect the conversation?"},
-        }
+            {"criteria": "Does the summary reflect the conversation?"},
+            metric_type="llm_judge",
+        )
     ]
-    job, _ = _job_from_payloads(client, temp_root, [make_payload()], checks=checks)
+    job, _ = _job_from_payloads(client, temp_root, [make_payload()], metrics=metrics)
     drain()
 
     result = client.get(f"/v1/evaluation-jobs/{job['id']}/results").json()["items"][0]
@@ -273,7 +282,7 @@ def test_two_runners_share_the_workload_without_overlap(client, temp_root, deter
         client,
         temp_root,
         [make_payload() for _ in range(6)],
-        checks=deterministic_config["checks"],
+        metrics=deterministic_config["metrics"],
     )
 
     import threading

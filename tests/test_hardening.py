@@ -8,13 +8,13 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.main import app
+from evalorch.main import app
 
-from app.core.config import Settings
-from app.core.database import transaction
-from app.models.enums import ErrorClass
-from app.services.errors import classify_error
-from app.services.ticket_service import claim_tickets, heartbeat_ticket
+from evalorch.core.config import Settings
+from evalorch.core.database import transaction
+from evalorch.models.enums import ErrorClass
+from evalorch.services.errors import classify_error
+from evalorch.services.ticket_service import claim_tickets, heartbeat_ticket
 
 
 def _error(response):
@@ -60,7 +60,7 @@ def test_value_error_and_unexpected_errors_hide_internals(client, monkeypatch):
     def bad_value(*_args, **_kwargs):
         raise ValueError("password=hunter2 SELECT secret FROM C:\\private\\eval.sql")
 
-    monkeypatch.setattr("app.api.jobs.create_job", bad_value)
+    monkeypatch.setattr("evalorch.api.jobs.create_job", bad_value)
     invalid = client.post("/v1/evaluation-jobs", json={"dataset_id": "folder-1"})
     assert invalid.status_code == 400
     assert _error(invalid)["code"] == "BAD_REQUEST"
@@ -75,7 +75,7 @@ def test_value_error_and_unexpected_errors_hide_internals(client, monkeypatch):
         def list(self, **_kwargs):
             raise RuntimeError("password=hunter2 SELECT secret FROM C:\\private\\eval.sql")
 
-    monkeypatch.setattr("app.api.jobs.JobRepository", BoomRepository)
+    monkeypatch.setattr("evalorch.api.jobs.JobRepository", BoomRepository)
     with TestClient(app, raise_server_exceptions=False) as quiet:
         quiet.headers.update({"X-API-Key": "test-api-key"})
         failed = quiet.get("/v1/evaluation-jobs")
@@ -92,7 +92,7 @@ def test_value_error_and_unexpected_errors_hide_internals(client, monkeypatch):
 
 def test_readiness_failure_does_not_expose_the_database_error(client, monkeypatch):
     monkeypatch.setattr(
-        "app.api.health.healthcheck",
+        "evalorch.api.health.healthcheck",
         lambda: (False, "password=hunter2 postgresql://user:secret@localhost SELECT"),
     )
     ready = client.get("/health/ready")
@@ -148,6 +148,14 @@ def test_programming_errors_are_permanent_and_timeouts_stay_transient():
     assert classify_error(TimeoutError()) is ErrorClass.TRANSIENT
 
 
+def test_operational_limits_use_their_configured_defaults():
+    configured = Settings()
+    assert configured.persist_deadlock_max_retries == 5
+    assert configured.persist_deadlock_backoff_base_seconds == 0.05
+    assert configured.runner_recovery_batch_limit == 100
+    assert configured.idempotency_key_max_length == 200
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -159,6 +167,10 @@ def test_programming_errors_are_permanent_and_timeouts_stay_transient():
         {"runner_max_attempts": 0},
         {"runner_retry_backoff_seconds": "nope"},
         {"runner_recovery_interval_seconds": 0},
+        {"runner_recovery_batch_limit": 0},
+        {"persist_deadlock_max_retries": 0},
+        {"persist_deadlock_backoff_base_seconds": -0.01},
+        {"idempotency_key_max_length": 0},
         {"db_statement_timeout_ms": -1},
         {"db_idle_in_transaction_timeout_ms": -1},
     ],
@@ -175,7 +187,7 @@ def _without_api_key(client):
 def test_api_key_comparison_uses_compare_digest(monkeypatch):
     import secrets
 
-    from app.core.security import verify_api_key
+    from evalorch.core.security import verify_api_key
 
     seen: dict[str, tuple[str, str]] = {}
     original = secrets.compare_digest
@@ -184,7 +196,7 @@ def test_api_key_comparison_uses_compare_digest(monkeypatch):
         seen["args"] = (left, right)
         return original(left, right)
 
-    monkeypatch.setattr("app.core.security.secrets.compare_digest", _compare)
+    monkeypatch.setattr("evalorch.core.security.secrets.compare_digest", _compare)
     import asyncio
 
     assert asyncio.run(verify_api_key("test-api-key")) == "test-api-key"
@@ -192,7 +204,7 @@ def test_api_key_comparison_uses_compare_digest(monkeypatch):
 
 
 def test_authentication_fail_closed_matrix(client, monkeypatch):
-    from app.core.config import settings
+    from evalorch.core.config import settings
 
     monkeypatch.setattr(settings, "api_key", "test-api-key")
     monkeypatch.setattr(settings, "app_env", "production")
@@ -217,7 +229,7 @@ def test_authentication_fail_closed_matrix(client, monkeypatch):
 
 
 def test_development_auth_bypass_logs_a_startup_warning(monkeypatch, capsys):
-    from app.core.config import settings
+    from evalorch.core.config import settings
 
     monkeypatch.setattr(settings, "api_key", "")
     monkeypatch.setattr(settings, "app_env", "local")
@@ -233,8 +245,8 @@ def test_development_auth_bypass_logs_a_startup_warning(monkeypatch, capsys):
 def test_postgres_statement_timeouts_are_applied(monkeypatch):
     from sqlalchemy import text
 
-    from app.core import database
-    from app.core.config import settings
+    from evalorch.core import database
+    from evalorch.core.config import settings
 
     monkeypatch.setattr(settings, "db_statement_timeout_ms", 45000)
     monkeypatch.setattr(settings, "db_idle_in_transaction_timeout_ms", 20000)
@@ -268,7 +280,7 @@ def _postgres_timeout_ms(shown: str) -> int:
 
 
 def test_structured_logs_redact_secrets_and_keep_context(capsys):
-    from app.core.logging import get_logger
+    from evalorch.core.logging import get_logger
 
     log = get_logger("redaction-test")
     log.info(

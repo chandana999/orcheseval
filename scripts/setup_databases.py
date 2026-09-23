@@ -18,13 +18,14 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(_ROOT / "src"), str(_ROOT)]
 
 import psycopg  # noqa: E402
 from psycopg import sql  # noqa: E402
 from psycopg.rows import dict_row  # noqa: E402
 
-from app.core.config import settings  # noqa: E402
+from evalorch.core.config import settings  # noqa: E402
 
 
 def admin_conninfo(args: argparse.Namespace, dbname: str) -> str:

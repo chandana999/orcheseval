@@ -1,38 +1,60 @@
 {
-  "agents": [
+  "agentId": "3f1a8c2e-6b44-4d7a-9e10-2c8b5a7d6e01",
+  "metrics": [
     {
-      "agent_id": "support-triage-agent",
-      "checks": [
-        {
-          "check_id": "summary_present",
-          "evaluator": "required_fields",
-          "input_mapping": {"summary": "summarizer.output.summary"},
-          "params": {"fields": ["summary"]},
-          "priority": 5
-        },
-        {
-          "check_id": "workflow_sequence",
-          "evaluator": "workflow_order",
-          "input_mapping": {"spans": "spans"},
-          "params": {
-            "expected_order": ["classifier", "validator", "summarizer"],
-            "mode": "subsequence"
-          }
-        },
-        {
-          "check_id": "policy_tool_called",
-          "evaluator": "tool_calls",
-          "input_mapping": {"tool_calls": "validator.tool_calls"},
-          "params": {"expected_tools": ["policy_lookup"], "require_response": true}
-        },
-        {
-          "check_id": "all_agents_ran",
-          "evaluator": "span_exists",
-          "input_mapping": {"spans": "spans"},
-          "params": {"required_spans": ["classifier", "validator", "summarizer"]},
-          "priority": 10
-        }
-      ]
+      "metricId": "summary_present",
+      "metricName": "Summary present",
+      "metricVersion": "1.0",
+      "metricType": "deterministic",
+      "evaluatorPluginId": "required_fields",
+      "enabled": true,
+      "spanNames": ["summarizer"],
+      "thresholds": {"pass": 1.0, "fail": 0.0},
+      "weight": 5,
+      "inputMapping": {"summary": "summarizer.attributes.output.summary"},
+      "params": {"fields": ["summary"]}
+    },
+    {
+      "metricId": "workflow_sequence",
+      "metricName": "Workflow sequence",
+      "metricVersion": "1.0",
+      "metricType": "deterministic",
+      "evaluatorPluginId": "workflow_order",
+      "enabled": true,
+      "spanNames": ["classifier", "validator", "summarizer"],
+      "thresholds": {"pass": 1.0, "fail": 0.0},
+      "weight": 0,
+      "inputMapping": {"spans": "spans"},
+      "params": {
+        "expected_order": ["classifier", "validator", "summarizer"],
+        "mode": "subsequence"
+      }
+    },
+    {
+      "metricId": "policy_tool_called",
+      "metricName": "Policy tool called",
+      "metricVersion": "1.0",
+      "metricType": "deterministic",
+      "evaluatorPluginId": "tool_calls",
+      "enabled": true,
+      "spanNames": ["validator"],
+      "thresholds": {"pass": 1.0, "fail": 0.0},
+      "weight": 0,
+      "inputMapping": {"tool_calls": "validator.attributes.tool_calls"},
+      "params": {"expected_tools": ["policy_lookup"], "require_response": true}
+    },
+    {
+      "metricId": "all_agents_ran",
+      "metricName": "All agents ran",
+      "metricVersion": "1.0",
+      "metricType": "deterministic",
+      "evaluatorPluginId": "span_exists",
+      "enabled": true,
+      "spanNames": ["classifier", "validator", "summarizer"],
+      "thresholds": {"pass": 1.0, "fail": 0.0},
+      "weight": 10,
+      "inputMapping": {"spans": "spans"},
+      "params": {"required_spans": ["classifier", "validator", "summarizer"]}
     }
   ]
 }

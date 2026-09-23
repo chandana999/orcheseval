@@ -6,7 +6,7 @@ import json
 
 from tests.conftest import (
     DEFAULT_AGENT_ID,
-    DETERMINISTIC_CHECKS,
+    OTHER_AGENT_ID,
     make_payload,
     write_dataset,
 )
@@ -115,7 +115,7 @@ def test_valid_payload_matches_agent_id(client, temp_root):
     write_dataset(temp_root, dataset_id, [make_payload()])
     body = _create(client, dataset_id).json()
     tickets = client.get(f"/v1/evaluation-jobs/{body['job']['id']}/tickets").json()["items"]
-    assert {t["evaluation_profile_id"] for t in tickets} == {DEFAULT_AGENT_ID}
+    assert {t["agent_id"] for t in tickets} == {DEFAULT_AGENT_ID}
 
 
 def test_missing_agent_registry(client, temp_root):
@@ -135,7 +135,7 @@ def test_missing_agent_id(client, temp_root):
 
 
 def test_agent_not_in_config(client, temp_root):
-    write_dataset(temp_root, "unknown-agent", [make_payload(agent_id="missing-agent")])
+    write_dataset(temp_root, "unknown-agent", [make_payload(agent_id=OTHER_AGENT_ID)])
     response = _create(client, "unknown-agent")
     assert response.status_code == 404
     assert "not found" in response.json()["error"]["message"]
@@ -146,46 +146,25 @@ def test_agent_with_no_checks(client, temp_root):
         temp_root,
         "no-checks",
         [make_payload()],
-        config={"agents": [{"agent_id": DEFAULT_AGENT_ID, "checks": []}]},
+        config={"agentId": DEFAULT_AGENT_ID, "metrics": []},
     )
     response = _create(client, "no-checks")
     assert response.status_code == 400
-    assert "no checks" in response.json()["error"]["message"]
+    assert "metrics" in response.json()["error"]["message"]
 
 
-def test_multiple_payloads_with_different_agents(client, temp_root):
-    span_check = {
-        "check_id": "spans_exist",
-        "evaluator": "span_exists",
-        "input_mapping": {"spans": "spans"},
-        "params": {"required_spans": ["classifier"]},
-    }
+def test_payload_for_a_different_agent_is_rejected(client, temp_root):
     write_dataset(
         temp_root,
         "multi-agent",
         [
             make_payload(agent_id=DEFAULT_AGENT_ID),
-            make_payload(agent_id="span-agent"),
+            make_payload(agent_id=OTHER_AGENT_ID),
         ],
-        config={
-            "agents": [
-                {"agent_id": DEFAULT_AGENT_ID, "checks": DETERMINISTIC_CHECKS},
-                {"agent_id": "span-agent", "checks": [span_check]},
-            ]
-        },
     )
-    body = _create(client, "multi-agent").json()
-    assert body["payload_count"] == 2
-    assert body["ticket_count"] == 4  # 3 + 1
-    assert set(body["profiles"]) == {DEFAULT_AGENT_ID, "span-agent"}
-    assert body["tickets_summary"]["by_agent"][DEFAULT_AGENT_ID] == 3
-    assert body["tickets_summary"]["by_agent"]["span-agent"] == 1
-
-
-def test_correct_payload_times_metric_ticket_count(client, temp_root):
-    write_dataset(temp_root, "count-me", [make_payload() for _ in range(3)])
-    body = _create(client, "count-me").json()
-    assert body["ticket_count"] == 3 * 3
+    response = _create(client, "multi-agent")
+    assert response.status_code == 404
+    assert "not found" in response.json()["error"]["message"]
 
 
 def test_job_creation_is_transactional_on_second_payload_failure(client, temp_root):

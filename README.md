@@ -14,6 +14,8 @@ FastAPI
 
 PostgreSQL is the queue. Claiming uses `FOR UPDATE SKIP LOCKED`. See `docs/architecture.md` for the ticket lifecycle and `docs/operations.md` for running it.
 
+The Python package is `src/evalorch`. Imports are `evalorch.*`. `pip install -e .` is what puts that package on the path for uvicorn and the runner.
+
 ## Prerequisites
 
 - Python 3.11+
@@ -59,7 +61,7 @@ Alembic revisions: `0001_initial`, then `0002_job_idempotency`.
 API:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+.\.venv\Scripts\python.exe -m uvicorn evalorch.main:app --host 127.0.0.1 --port 8001
 ```
 
 Runner (separate process):

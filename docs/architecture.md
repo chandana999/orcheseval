@@ -41,6 +41,6 @@ If the runner stops, it stops claiming, lets in-flight tickets finish, and stops
 
 ## Evaluation and datasets
 
-The runner loads the ticket snapshot from PostgreSQL and reads the payload file from `EVALUATION_TEMP_ROOT/<dataset_id>/`. Checks were copied from that folder's `config.json` when the job was created. Results are upserted on `ticket_id` only after the ownership check succeeds.
+The runner loads the ticket snapshot from PostgreSQL and reads the payload file from `EVALUATION_TEMP_ROOT/<dataset_id>/`. `config.json` names the agent in `agentId` and lists `metrics`. Those metrics are copied onto the tickets when the job is created. The payload carries execution data under `agent_registry`, `payload_metadata`, `correlation`, and `trace_context.trace.spans`. Results are upserted on `ticket_id` only after the ownership check succeeds.
 
 Dataset files are not copied into PostgreSQL. They must remain in place until the job no longer needs them.

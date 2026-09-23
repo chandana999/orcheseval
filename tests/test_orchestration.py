@@ -7,15 +7,15 @@ import uuid
 import pytest
 from sqlalchemy import text
 
-from app.core.database import open_session, transaction
-from app.models.entities import EvaluationResult
-from app.models.enums import IllegalTicketTransition, JobStatus, ResultStatus, TicketStatus
-from app.repositories.job_repository import JobRepository
-from app.repositories.result_repository import ResultRepository
-from app.repositories.ticket_repository import StaleWorkerError, TicketRepository
-from app.services.evaluation_service import execute_ticket
-from app.services.recovery_service import recover_abandoned_tickets
-from app.services.ticket_service import claim_tickets, settle_ticket
+from evalorch.core.database import open_session, transaction
+from evalorch.models.entities import EvaluationResult
+from evalorch.models.enums import IllegalTicketTransition, JobStatus, ResultStatus, TicketStatus
+from evalorch.repositories.job_repository import JobRepository
+from evalorch.repositories.result_repository import ResultRepository
+from evalorch.repositories.ticket_repository import StaleWorkerError, TicketRepository
+from evalorch.services.evaluation_service import execute_ticket
+from evalorch.services.recovery_service import recover_abandoned_tickets
+from evalorch.services.ticket_service import claim_tickets, settle_ticket
 
 
 def _raw_connection():
@@ -359,7 +359,7 @@ def test_heartbeat_extends_only_the_owning_workers_lease(seeded_job):
 
 
 def test_transient_attempts_retry_until_max_then_fail(seeded_job, monkeypatch):
-    from app.services.errors import TransientEvaluationError
+    from evalorch.services.errors import TransientEvaluationError
 
     class Boom:
         name = "required_fields"
@@ -367,7 +367,7 @@ def test_transient_attempts_retry_until_max_then_fail(seeded_job, monkeypatch):
         def run(self, values, check, context):
             raise TransientEvaluationError("provider timeout")
 
-    monkeypatch.setattr("app.services.evaluation_service.get_evaluator", lambda name: Boom())
+    monkeypatch.setattr("evalorch.services.evaluation_service.get_evaluator", lambda name: Boom())
     ticket_id = None
     steps = ((1, TicketStatus.RETRY), (2, TicketStatus.RETRY), (3, TicketStatus.FAILED))
     for attempt, expected in steps:

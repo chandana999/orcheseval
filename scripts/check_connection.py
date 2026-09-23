@@ -5,13 +5,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(_ROOT / "src"), str(_ROOT)]
 
 from sqlalchemy import text  # noqa: E402
 
-from app.core.config import settings  # noqa: E402
-from app.core.database import get_engine  # noqa: E402
-from app.db.migrate import current  # noqa: E402
+from evalorch.core.config import settings  # noqa: E402
+from evalorch.core.database import get_engine  # noqa: E402
+from evalorch.db.migrate import current  # noqa: E402
 
 
 def main() -> int:
